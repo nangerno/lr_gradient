@@ -1,123 +1,74 @@
-from model_utility import get_model_architecture, get_model_num_params, get_use_liger, disable_flash_attention, get_gradient_checkpointing, get_gpu_count
+from model_utility import (
+    get_model_architecture,
+    get_model_num_params,
+    get_use_liger,
+    disable_flash_attention,
+    get_gradient_checkpointing,
+    get_gpu_count,
+)
 from copy import deepcopy
 from lrs_lookup import get_dpo_lr
 
-DPO_CONFIG = {
-    "0_1_b": {
-        "lr": 1.35e-5,
-        "distributed": "ddp",
-        "gpu_count": 1,
-        "batch_size": 16,
-    },
-    "1_2_b": {
-        "lr": 8.7e-6,
-        "distributed": "ddp",
-        "gpu_count": 1,
-        "batch_size": 12,
-    },
-    "2_4_b": {
-        "lr": 6.5e-6,
-        "distributed": "ddp",
-        "gpu_count": 2,
-        "batch_size": 12,
-        "use_lora": True
-    },
-    "4_5_b": {
-        "lr": 6.25e-6,
-        "distributed": "ddp",
-        "gpu_count": 4,
-        "batch_size": 12,
-        "use_lora": True
-    },
-    "5_9_b": {
-        "lr": 7.5e-6,
-        "distributed": "ddp",
-        "gpu_count": 4,
-        "batch_size": 8,
-        "use_lora": True
-    },
-    "9_12_b": {
-        "lr": 5e-6,
-        "distributed": "ds",
-        "gpu_count": 4,
-        "use_lora": True,
-        "batch_size": 32,
-        "gradient_checkpointing": False
-    },
-    "12_14_b": {
-        "lr": 8.5e-6,
-        "distributed": "ds",
-        "gpu_count": 4,
-        "use_lora": True,
-        "batch_size": 24,
-        "gradient_checkpointing": False
-    },
-    "14_15_b": {
-        "lr": 8.5e-6,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "use_lora": True,
-        "batch_size": 18,
-        "gradient_checkpointing": False
-    },
-    "15_40_b": {
-        "lr": 8e-6,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "use_lora": True,
-        "batch_size": 16,
-        "gradient_checkpointing": False
-    },
-    "40_80_b": {
-        "lr": 8e-6,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "use_lora": True,
-        "batch_size": 8,
-        "gradient_checkpointing": False
-    }        
-}
 
-for key in DPO_CONFIG:
-    DPO_CONFIG[key]["label"] = key
-    
+def _bs_from_param_nums(param_nums) -> int:
+    if param_nums is None:
+        return 8
+    p = param_nums
+    if p < 1_000_000_000:       # < 1 B
+        return 16
+    if p < 3_000_000_000:       # 1 B – 3 B
+        return 8
+    if p < 7_000_000_000:       # 3 B – 7 B
+        return 6
+    if p < 13_000_000_000:      # 7 B – 13 B  — DeepSpeed, more headroom
+        return 4
+    if p < 30_000_000_000:      # 13 B – 30 B
+        return 2
+    return 1                    # 30 B +
 
-def get_config(param_nums: int) -> dict:
-    result = None
-    if param_nums < 1_000_000_000:
-        result = DPO_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        result = DPO_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        result = DPO_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        result = DPO_CONFIG["4_5_b"]
-    elif param_nums < 9_000_000_000:
-        result = DPO_CONFIG["5_9_b"]
-    elif param_nums < 12_000_000_000:
-        result = DPO_CONFIG["9_12_b"]
-    elif param_nums < 14_000_000_000:
-        result = DPO_CONFIG["12_14_b"]
-    elif param_nums < 15_000_000_000:  
-        result = DPO_CONFIG["14_15_b"]
-    elif param_nums < 35_000_000_000:
-        result = DPO_CONFIG["15_40_b"]
-    elif param_nums < 80_000_000_000:
-        result = DPO_CONFIG["40_80_b"]
-    else:
-        print(f"Model size {param_nums} is not supported", flush=True)
-        result = {
-            "lr": 4e-5,
-            "distributed": "ds",
-            "gpu_count": 8,
-            "batch_size": 6,
-            "use_lora": True
-        }
-    if param_nums < 4_000_000_000 and param_nums > 1_330_000_000:
-        result["gpu_count"] = 2
-    if param_nums > 13_330_000_000: # 8 GPUs for 13.3B
-        result["gpu_count"] = 8
-    return result
+
+def _lr_from_param_nums(param_nums) -> float:
+    if param_nums is None:
+        return 1e-5
+    p = param_nums
+    if p < 1_000_000_000:       # < 1 B
+        return 1.5e-5
+    if p < 3_000_000_000:       # 1 B – 3 B
+        return 1e-5
+    if p < 7_000_000_000:       # 3 B – 7 B
+        return 7e-6
+    if p < 13_000_000_000:      # 7 B – 13 B
+        return 5e-6
+    if p < 30_000_000_000:      # 13 B – 30 B
+        return 4e-6
+    if p < 70_000_000_000:      # 30 B – 70 B
+        return 3e-6
+    return 2e-6                 # 70 B +
+
+
+def _gpu_count_from_param_nums(param_nums) -> int:
+    if param_nums is None:
+        return 4
+    p = param_nums
+    if p < 1_330_000_000:       # < 1.33 B
+        return 1
+    if p < 4_000_000_000:       # 1.33 B – 4 B
+        return 2
+    if p < 13_330_000_000:      # 4 B – 13.3 B
+        return 4
+    return 8                    # 13.3 B +
+
+
+def _distributed_from_param_nums(param_nums) -> str:
+    if param_nums is None or param_nums < 9_000_000_000:
+        return "ddp"
+    return "ds"
+
+
+def _use_lora_from_param_nums(param_nums) -> bool:
+    if param_nums is None:
+        return True
+    return param_nums >= 2_000_000_000
 
 
 def get_run_cmd(config: dict, gpu_nums: int):
@@ -133,6 +84,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     for key in required_keys:
         if key not in config:
             raise ValueError(f"Required key {key} not found in config")
+
     gpu_nums = get_gpu_count()
     start_cmd = "python"
     run_type = config.get("distributed", "ddp")
@@ -177,11 +129,10 @@ def get_run_cmd(config: dict, gpu_nums: int):
 
     for key, value in config.items():
         template = template.replace("{" + key + "}", str(value))
-    
+
     if config.get("use_attn_implementation", ""):
-        use_attn_implementation = config["use_attn_implementation"]
-        template = template + f""" --use_attn_implementation {use_attn_implementation}"""
-        
+        template += f""" --use_attn_implementation {config["use_attn_implementation"]}"""
+
     return template
 
 
@@ -190,53 +141,70 @@ def get_training_json(train_info: dict) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-    config = get_config(param_nums)
+
     run_config = {
         "epoch_num": 3,
-        "batch_size": config["batch_size"],
-        "learning_rate": config["lr"],
+        "batch_size": _bs_from_param_nums(param_nums),
+        "learning_rate": _lr_from_param_nums(param_nums),
         "min_lr_rate": 0.25,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
-        "use_lora": config.get("use_lora", False),
+        "use_lora": _use_lora_from_param_nums(param_nums),
         "disable_fa": disable_flash_attention(model_architecture, model_name),
-        "gpu_nums": config["gpu_count"],
+        "gpu_nums": _gpu_count_from_param_nums(param_nums),
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
-        "distributed": config.get("distributed", "ddp"),
+        "distributed": _distributed_from_param_nums(param_nums),
         "gradient_checkpointing": get_gradient_checkpointing(model_name),
         "gradient_accumulation_steps": 1,
-        "use_attn_implementation": "kernels-community/vllm-flash-attn3" if train_info.get("is_openai", False) else ""
+        "use_attn_implementation": (
+            "kernels-community/vllm-flash-attn3"
+            if train_info.get("is_openai", False)
+            else ""
+        ),
     }
-    
-    if not config.get("gradient_checkpointing", True):
-        run_config["gradient_checkpointing"] = False
-    
-    total_batch_size = run_config["batch_size"] * run_config["gpu_nums"]
-    if total_batch_size < 64:
-        run_config["gradient_accumulation_steps"] = min(4, int(64 / total_batch_size))
-    
+
+    # 🔁 Recompute gradient accumulation after batch size is set
+    data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
+    if data_per_step < 64:
+        run_config["gradient_accumulation_steps"] = min(4, int(64 / data_per_step))
+
+    # 🚀 DYNAMIC LR + BATCH SIZE
     if train_info["find_lk_lr"]:
-        # get lr from lrs_lookup.py
-        lr = get_dpo_lr(model_name)
-        if lr is not None:
-            print(f"Using lr from lk: {lr}", flush=True)
-            run_config["learning_rate"] = lr
+        dataset_path = train_info.get("dataset", "")
+        dataset_type_dict = train_info.get("dataset_type", {})
+
+        lr_result = get_dpo_lr(model_name, model_path, param_nums, dataset_path, dataset_type_dict)
+
+        if lr_result is not None:
+            lr = lr_result.get("lr")
+            bs = lr_result.get("batch_size")
+
+            if lr is not None:
+                print(f"Using lr from dynamic finder: {lr}", flush=True)
+                run_config["learning_rate"] = lr
+            else:
+                fallback_lr = _lr_from_param_nums(param_nums)
+                print(f"LR finder returned no lr, using param-based fallback: {fallback_lr}", flush=True)
+                run_config["learning_rate"] = fallback_lr
+
+            if bs is not None:
+                print(f"Using batch size from dynamic finder: {bs}", flush=True)
+                run_config["batch_size"] = bs
         else:
-            print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
-    
+            print(f"LR finder failed, using param-based fallback: {run_config['learning_rate']}", flush=True)
+
     run_config["learning_rate"] *= train_info["reg_ratio"]
+
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     if run_config["disable_fa"] == "False":
         run_cmd = run_cmd + " --padding_free True"
+
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
     train_request["checking_step"] = 80
-    
-    return {
-        "train_request": train_request,
-        "run_cmd": run_cmd
-    }
+
+    return {"train_request": train_request, "run_cmd": run_cmd}

@@ -1,54 +1,93 @@
-import json 
-import os 
-import hashlib
-current_dir = os.path.dirname(os.path.abspath(__file__))
+from typing import Optional
+from lr_finder import find_lr
+
+_DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
+_DPO_GRPO_LORA_R         = 128
+_DPO_GRPO_LORA_ALPHA     = 256
+_DPO_GRPO_LORA_DROPOUT   = 0.05
 
 
-with open(os.path.join(current_dir, "lrs/dpo.json"), "r") as f:
-    dpo_lrs = json.load(f)
-
-with open(os.path.join(current_dir, "lrs/grpo.json"), "r") as f:
-    grpo_lrs = json.load(f)
-
-with open(os.path.join(current_dir, "lrs/instruct.json"), "r") as f:
-    instruct_lrs = json.load(f)
-
-with open(os.path.join(current_dir, "lrs/grpo_python.json"), "r") as f:
-    grpo_python_lrs = json.load(f)
-
-
-def hash_model(model: str) -> str:
-    model_bytes = model.encode('utf-8')
-    hashed = hashlib.sha256(model_bytes).hexdigest()
-    return hashed 
-
-
-def get_dpo_lr(model: str):
-    hashed_model = hash_model(model)
-    for lr in dpo_lrs:
-        if lr["h"] == hashed_model:
-            return lr["lr"]
-    return None
+def get_instruct_lr(
+    model_id: str,
+    model_path: str,
+    num_params: Optional[int],
+    dataset_path: str,
+    dataset_type_dict: dict,
+) -> Optional[float]:
+    if not dataset_path:
+        return None
+    return find_lr(
+        model_id, model_path, num_params,
+        dataset_path, dataset_type_dict,
+        train_type="instruct",
+        min_lr=3e-6,
+        max_lr=2.35e-3,
+        steps=40,                   # more steps → less noisy loss curve on small datasets
+        lora_threshold=None,        # instruct trains full-weight — no LoRA in probe
+    )
 
 
-def get_grpo_lr(model: str):
-    hashed_model = hash_model(model)
-    for lr in grpo_lrs:
-        if lr["h"] == hashed_model:
-            return lr["lr"]
-    return None
+def get_dpo_lr(
+    model_id: str,
+    model_path: str,
+    num_params: Optional[int],
+    dataset_path: str,
+    dataset_type_dict: dict,
+) -> Optional[float]:
+    if not dataset_path:
+        return None
+    return find_lr(
+        model_id, model_path, num_params,
+        dataset_path, dataset_type_dict,
+        train_type="dpo",
+        min_lr=5e-7,
+        max_lr=1.70e-4,
+        lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
+        lora_r=_DPO_GRPO_LORA_R,
+        lora_alpha=_DPO_GRPO_LORA_ALPHA,
+        lora_dropout=_DPO_GRPO_LORA_DROPOUT,
+    )
 
-def get_instruct_lr(model: str):
-    hashed_model = hash_model(model)
-    for lr in instruct_lrs:
-        if lr["h"] == hashed_model:
-            return lr["lr"]
-    return None
+
+def get_grpo_lr(
+    model_id: str,
+    model_path: str,
+    num_params: Optional[int],
+    dataset_path: str,
+    dataset_type_dict: dict,
+) -> Optional[float]:
+    if not dataset_path:
+        return None
+    return find_lr(
+        model_id, model_path, num_params,
+        dataset_path, dataset_type_dict,
+        train_type="grpo",
+        min_lr=1e-5,
+        max_lr=8.64e-4,
+        lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
+        lora_r=_DPO_GRPO_LORA_R,
+        lora_alpha=_DPO_GRPO_LORA_ALPHA,
+        lora_dropout=_DPO_GRPO_LORA_DROPOUT,
+    )
 
 
-def get_grpo_python_lr(model: str):
-    hashed_model = hash_model(model)
-    for lr in grpo_python_lrs:
-        if lr["h"] == hashed_model:
-            return lr["lr"]
-    return None
+def get_grpo_python_lr(
+    model_id: str,
+    model_path: str,
+    num_params: Optional[int],
+    dataset_path: str,
+    dataset_type_dict: dict,
+) -> Optional[float]:
+    if not dataset_path:
+        return None
+    return find_lr(
+        model_id, model_path, num_params,
+        dataset_path, dataset_type_dict,
+        train_type="grpo",
+        min_lr=3e-6,
+        max_lr=1.60e-3,
+        lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
+        lora_r=_DPO_GRPO_LORA_R,
+        lora_alpha=_DPO_GRPO_LORA_ALPHA,
+        lora_dropout=_DPO_GRPO_LORA_DROPOUT,
+    )

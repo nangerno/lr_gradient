@@ -13,14 +13,22 @@ import json
 import torch
 
 MODEL_CONFIG = {
-    "facebook/opt-1.3b": {"model_size": 1_300_000_000},
-    "facebook/opt-3b": {"model_size": 3_000_000_000},
-    "facebook/opt-6.7b": {"model_size": 6_700_000_000},
-    "facebook/opt-13b": {"model_size": 13_000_000_000},
-    "EleutherAI/gpt-neo-1.3B": {"model_size": 1_300_000_000},
-    "EleutherAI/gpt-neo-125m": {"model_size": 125_000_000},
-    "bigscience/bloom-560m": {"model_size": 560_000_000},
     "TinyLlama/TinyLlama_v1.1": {"model_size": 1_100_000_000},
+    "TitanML/tiny-mixtral": {"model_size": 246_000_000},
+    "dltjdgh0928/test_instruction": {"model_size": 7_200_000_000},
+    "microsoft/Phi-3-mini-128k-instruct": {"model_size": 3_800_000_000},
+    "microsoft/Phi-3-mini-4k-instruct": {"model_size": 3_800_000_000},
+    "microsoft/Phi-3.5-mini-instruct": {"model_size": 3_800_000_000},
+    "microsoft/phi-1_5": {"model_size": 1_400_000_000},
+    "microsoft/phi-2": {"model_size": 2_780_000_000},
+    "numind/NuExtract-v1.5": {"model_size": 3_800_000_000},
+    "unsloth/Mistral-Nemo-Base-2407": {"model_size": 12_000_000_000},
+    "unsloth/Phi-3-medium-4k-instruct": {"model_size": 13_000_000_000},
+    "unsloth/Phi-3-mini-4k-instruct": {"model_size": 3_800_000_000},
+    "unsloth/Phi-3.5-mini-4k-instruct": {"model_size": 3_800_000_000},
+    "unsloth/tinyllama": {"model_size": 1_100_000_000},
+    "unsloth/tinyllama-chat": {"model_size": 1_100_000_000},
+    "unsloth/zephyr-sft": {"model_size": 7_200_000_000},
 }
 
 hf_api = HfApi()
@@ -102,26 +110,29 @@ def get_gpu_count():
 
 
 def get_model_num_params(model_id: str, model_path: str) -> int:
+    # 1. Try to extract size directly from the model_id string (e.g. "7B", "1.3b", "0.5M")
+    size_match = re.search(r"(\d+(?:\.\d+)?)([mMbB])\b", model_id)
+    if size_match:
+        amount = float(size_match.group(1))
+        suffix = size_match.group(2).lower()
+        multiplier = 1_000_000 if suffix == "m" else 1_000_000_000
+        model_size = int(amount * multiplier)
+        print(f"Model size from model_id regex: {model_size}")
+        return model_size
+
+    # 2. Fall back to the hard-coded config table
     if model_id in MODEL_CONFIG:
         return MODEL_CONFIG[model_id]["model_size"]
+
+    # 3. Count parameters directly from local safetensors / bin files
     try:
         size = get_model_size_from_local_path(model_path)
         if size is not None:
             return size
         raise Exception(f"Cannot get model size from {model_path}")
-
     except Exception as e:
-        print(f"Error getting model size from safetensors: {e}")
-        try:
-            model_size = re.search(r"(\d+)(?=[bB])", model_id)
-            model_size = (
-                int(model_size.group(1)) * 1_000_000_000 if model_size else None
-            )
-            print(f"Model size from regex: {model_size}")
-            return model_size
-        except Exception as e:
-            print(f"Error getting model size from regex: {e}")
-            return None
+        print(f"Error getting model size from local path: {e}")
+        return None
 
 
 def disable_flash_attention(architecture: str, model: str) -> str:

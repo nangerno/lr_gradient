@@ -241,6 +241,19 @@ def main():
         donot_pack = True
         log_info(f"original_steps: {original_steps} < min_steps: {train_request['min_steps']}, do not pack the dataset")
 
+    # Skip packing when sequences are already short relative to max_length —
+    # packing only helps if sequences are long enough to fill a packed window.
+    # Use attention_mask sum on a small sample to get the real (pre-padding) length.
+    if not donot_pack and training_args.packing:
+        _sample = train_ds.eval_dataset[:min(200, len(train_ds.eval_dataset))]
+        _avg_actual_len = sum(len(ex["input_ids"]) for ex in _sample) / max(len(_sample), 1)
+        if _avg_actual_len < max_length / 8:
+            donot_pack = True
+            log_info(
+                f"Average token length {_avg_actual_len:.1f} < max_length/8 "
+                f"({max_length // 8}); skipping packing (sequences too short to benefit)"
+            )
+
     min_data_size_num = (
         train_request["min_steps"]
         * training_args.per_device_train_batch_size
