@@ -20,10 +20,10 @@ def get_instruct_lr(
         model_id, model_path, num_params,
         dataset_path, dataset_type_dict,
         train_type="instruct",
-        min_lr=3e-6,
-        max_lr=2.35e-3,
-        steps=40,                   # more steps → less noisy loss curve on small datasets
-        lora_threshold=None,        # instruct trains full-weight — no LoRA in probe
+        min_lr=5e-6,
+        max_lr=3e-3,
+        steps=40,          
+        lora_threshold=None,
     )
 
 
@@ -41,7 +41,7 @@ def get_dpo_lr(
         dataset_path, dataset_type_dict,
         train_type="dpo",
         min_lr=5e-7,
-        max_lr=1.70e-4,
+        max_lr=2.0e-4,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
@@ -62,8 +62,8 @@ def get_grpo_lr(
         model_id, model_path, num_params,
         dataset_path, dataset_type_dict,
         train_type="grpo",
-        min_lr=1e-5,
-        max_lr=8.64e-4,
+        min_lr=2e-5,
+        max_lr=8e-4,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
@@ -84,8 +84,8 @@ def get_grpo_python_lr(
         model_id, model_path, num_params,
         dataset_path, dataset_type_dict,
         train_type="grpo",
-        min_lr=3e-6,
-        max_lr=1.60e-3,
+        min_lr=4e-6,
+        max_lr=2.0e-3,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
