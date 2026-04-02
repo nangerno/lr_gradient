@@ -14,49 +14,49 @@ def _bs_from_param_nums(param_nums) -> int:
     if param_nums is None:
         return 8
     p = param_nums
-    if p < 1_000_000_000:       # < 1 B
+    if p < 1_000_000_000:       
         return 16
-    if p < 3_000_000_000:       # 1 B – 3 B
+    if p < 3_000_000_000:       
         return 8
-    if p < 7_000_000_000:       # 3 B – 7 B
+    if p < 7_000_000_000:       
         return 6
-    if p < 13_000_000_000:      # 7 B – 13 B  — DeepSpeed, more headroom
+    if p < 13_000_000_000:      
         return 4
-    if p < 30_000_000_000:      # 13 B – 30 B
+    if p < 30_000_000_000:      
         return 2
-    return 1                    # 30 B +
+    return 1                   
 
 
 def _lr_from_param_nums(param_nums) -> float:
     if param_nums is None:
         return 1e-5
     p = param_nums
-    if p < 1_000_000_000:       # < 1 B
+    if p < 1_000_000_000:       
         return 1.5e-5
-    if p < 3_000_000_000:       # 1 B – 3 B
+    if p < 3_000_000_000:       
         return 1e-5
-    if p < 7_000_000_000:       # 3 B – 7 B
+    if p < 7_000_000_000:       
         return 7e-6
-    if p < 13_000_000_000:      # 7 B – 13 B
+    if p < 13_000_000_000:      
         return 5e-6
-    if p < 30_000_000_000:      # 13 B – 30 B
+    if p < 30_000_000_000:      
         return 4e-6
-    if p < 70_000_000_000:      # 30 B – 70 B
+    if p < 70_000_000_000:      
         return 3e-6
-    return 2e-6                 # 70 B +
+    return 2e-6                
 
 
 def _gpu_count_from_param_nums(param_nums) -> int:
     if param_nums is None:
         return 4
     p = param_nums
-    if p < 1_330_000_000:       # < 1.33 B
+    if p < 1_330_000_000:       
         return 1
-    if p < 4_000_000_000:       # 1.33 B – 4 B
+    if p < 4_000_000_000:       
         return 2
-    if p < 13_330_000_000:      # 4 B – 13.3 B
+    if p < 13_330_000_000:      
         return 4
-    return 8                    # 13.3 B +
+    return 8                    
 
 
 def _distributed_from_param_nums(param_nums) -> str:
