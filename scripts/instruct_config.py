@@ -80,36 +80,36 @@ def _bs_from_param_nums(param_nums) -> int:
     if param_nums is None:
         return 16
     p = param_nums
-    if p < 1_000_000_000:       # < 1 B
+    if p < 1_000_000_000:       
         return 32
-    if p < 3_000_000_000:       # 1 B – 3 B
+    if p < 3_000_000_000:       
         return 16
-    if p < 7_000_000_000:       # 3 B – 7 B
+    if p < 7_000_000_000:       
         return 8
-    if p < 13_000_000_000:      # 7 B – 13 B
+    if p < 13_000_000_000:      
         return 4
-    if p < 30_000_000_000:      # 13 B – 30 B
+    if p < 30_000_000_000:      
         return 2
-    return 1                    # 30 B +
+    return 1                    
 
 
 def _lr_from_param_nums(param_nums) -> float:
     if param_nums is None:
         return 2e-5
     p = param_nums
-    if p < 1_000_000_000:       # < 1 B  — small models tolerate high LR
+    if p < 1_000_000_000:      
         return 5e-5
-    if p < 3_000_000_000:       # 1 B – 3 B
+    if p < 3_000_000_000:      
         return 3e-5
-    if p < 7_000_000_000:       # 3 B – 7 B  — Alpaca/Llama-2 7B range
+    if p < 7_000_000_000:      
         return 2e-5
-    if p < 13_000_000_000:      # 7 B – 13 B
+    if p < 13_000_000_000:      
         return 1e-5
-    if p < 30_000_000_000:      # 13 B – 30 B
+    if p < 30_000_000_000:      
         return 8e-6
-    if p < 70_000_000_000:      # 30 B – 70 B  — LLaMA-2 70B range
+    if p < 70_000_000_000:      
         return 5e-6
-    return 3e-6                 # 70 B +
+    return 3e-6                
 
 
 def get_training_json(train_info: dict) -> dict:
@@ -192,6 +192,6 @@ def get_training_json(train_info: dict) -> dict:
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
-    train_request["checking_step"] = 70
+    train_request["checking_step"] = 60
 
     return {"train_request": train_request, "run_cmd": run_cmd}
