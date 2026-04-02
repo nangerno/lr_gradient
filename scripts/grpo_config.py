@@ -159,7 +159,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --request_path {request_path} \
     --bf16 True \
     --report_to wandb \
-    --output_dir /workspace/data/trained_model \
+    --output_dir {output_dir} \
     --num_train_epochs {epoch_num} \
     --per_device_train_batch_size {batch_size} \
     --per_device_eval_batch_size {eval_batch_size} \

@@ -113,6 +113,8 @@ def find_max_batch_size(model, tokenizer, seq_len: int = 512, device: str = "cud
 # --------------------------------------------------------------------------- #
 
 def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
+    if points <= 1:
+        return [min_lr]
     log_min = math.log(min_lr)
     log_max = math.log(max_lr)
     step = (log_max - log_min) / (points - 1)
@@ -307,7 +309,7 @@ def find_lr(
     lora_r: int = _DEFAULT_LORA_R,
     lora_alpha: int = _DEFAULT_LORA_ALPHA,
     lora_dropout: float = _DEFAULT_LORA_DROPOUT,
-) -> Optional[float]:
+) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
         and num_params is not None

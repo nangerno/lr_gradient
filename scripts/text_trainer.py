@@ -4,20 +4,16 @@ Standalone script for text model training (InstructText, DPO, and GRPO)
 """
 
 import argparse
-import asyncio
 import json
 import os
 import shutil
 import copy
 import subprocess
 import sys
-import uuid
 import re
-import time 
+import time
 from datetime import datetime, timezone, timedelta
 
-import yaml
-from transformers import AutoTokenizer
 from state_manager import get_state, set_state
 import numpy as np
 
@@ -27,13 +23,7 @@ project_root = os.path.dirname(script_dir)
 sys.path.append(project_root)
 
 import train_cst
-from core.config.config_handler import create_dataset_entry
-from core.config.config_handler import save_config
-from core.config.config_handler import update_flash_attention
-from core.dataset_utils import adapt_columns_for_dpo_dataset
-from core.dataset_utils import adapt_columns_for_grpo_dataset
 from core.models.utility_models import DpoDatasetType
-from core.models.utility_models import FileFormat
 from core.models.utility_models import GrpoDatasetType
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import TaskType
@@ -208,6 +198,9 @@ def run_training(
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
+                    if current_batch_size is None:
+                        print("CUDA OOM — cannot extract batch size, skipping reduction", flush=True)
+                        continue
                     current_batch_size = int(current_batch_size)
                     if current_batch_size > 1:
                         new_batch_size = current_batch_size // 2
@@ -460,14 +453,8 @@ def main():
 
     original_train_cmd = train_cmd
     train_success = False
-    state = get_state()
-    state = {}
-    set_state(state) # reset first
-    state["mode"] = "initial"
-    # at first the state is always running the train_cmd
-
+    state = {"mode": "initial"}
     set_state(state)
-    # TODO Run something magic here
     count = 0
     while True:
         state = get_state()

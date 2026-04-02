@@ -1,28 +1,16 @@
-from typing import Dict, Optional
-import requests
+from typing import Dict, Optional, Callable
 import json
 import random
 from utility import log_info, MyDataset
-from transformers.trainer_utils import get_last_checkpoint
-from transformers import AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoTokenizer, BitsAndBytesConfig, Trainer, TrainingArguments
 import transformers
 import torch
 from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
-from transformers import Trainer
 from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
-
-# from packing.packed_dataset import PackedDataset
-from transformers import (
-    Trainer,
-    TrainingArguments,
-)
 
 import os
 import datetime
-import shutil
-from huggingface_hub import HfApi
-from typing import Callable, Optional
 import bitsandbytes as bnb
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml

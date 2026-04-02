@@ -1,5 +1,5 @@
 from typing import Optional
-from lr_finder import find_lr
+from lr_finder import find_lr  # find_lr returns Optional[dict] with keys "lr" and "batch_size"
 
 _DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
 _DPO_GRPO_LORA_R         = 128
@@ -13,7 +13,7 @@ def get_instruct_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
-) -> Optional[float]:
+) -> Optional[dict]:
     if not dataset_path:
         return None
     return find_lr(
@@ -33,7 +33,7 @@ def get_dpo_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
-) -> Optional[float]:
+) -> Optional[dict]:
     if not dataset_path:
         return None
     return find_lr(
@@ -55,7 +55,7 @@ def get_grpo_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
-) -> Optional[float]:
+) -> Optional[dict]:
     if not dataset_path:
         return None
     return find_lr(
@@ -77,7 +77,7 @@ def get_grpo_python_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
-) -> Optional[float]:
+) -> Optional[dict]:
     if not dataset_path:
         return None
     return find_lr(

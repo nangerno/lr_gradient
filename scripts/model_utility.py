@@ -1,16 +1,16 @@
+import re
+import os
+import json
+import glob
+import torch
+from pathlib import Path
+from huggingface_hub import HfApi
+from transformers import AutoConfig
+from safetensors.torch import load_file
+
 DPO = "dpo"
 GRPO = "grpo"
 INSTRUCT = "instruct"
-import re
-from huggingface_hub import HfApi
-from transformers import AutoConfig
-import glob
-from safetensors.torch import load_file
-from pathlib import Path
-import torch
-import os
-import json
-import torch
 
 MODEL_CONFIG = {
     "TinyLlama/TinyLlama_v1.1": {"model_size": 1_100_000_000},

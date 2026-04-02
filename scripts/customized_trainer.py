@@ -156,7 +156,7 @@ class CustomEvalSaveCallback(TrainerCallback):
             current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
             if current_loss <= current_min_loss:
                 if len(my_state["runs"]) + 1 == my_state["next_runs"]:
-                    print(f"Current loss: {my_state['train']['current_loss']} is greater than: {current_min_loss}", flush=True)
+                    print(f"Current loss {my_state['train']['current_loss']:.4f} is the best so far (prev best: {current_min_loss:.4f}), keeping full run", flush=True)
                     current_is_the_best = True
                     
             if current_is_the_best:
