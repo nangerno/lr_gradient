@@ -15,49 +15,49 @@ def _bs_from_param_nums(param_nums) -> int:
     if param_nums is None:
         return 16
     p = param_nums
-    if p < 2_000_000_000:       # < 2 B  — small model, vllm overhead is minor
+    if p < 2_000_000_000:
         return 40
-    if p < 6_000_000_000:       # 2 B – 6 B
+    if p < 6_000_000_000:
         return 24
-    if p < 9_000_000_000:       # 6 B – 9 B
+    if p < 9_000_000_000:
         return 16
-    if p < 12_000_000_000:      # 9 B – 12 B
+    if p < 12_000_000_000:
         return 8
-    if p < 15_000_000_000:      # 12 B – 15 B  — high vllm memory pressure
+    if p < 15_000_000_000:
         return 4
-    if p < 40_000_000_000:      # 15 B – 40 B  — vllm off, 4-bit quant
+    if p < 40_000_000_000:
         return 8
-    return 4                    # 40 B +  — 4-bit, large model
+    return 4              
 
 
 def _lr_from_param_nums(param_nums) -> float:
     if param_nums is None:
         return 8e-6
     p = param_nums
-    if p < 1_000_000_000:       # < 1 B
+    if p < 1_000_000_000: 
         return 1e-5
-    if p < 4_000_000_000:       # 1 B – 4 B
+    if p < 4_000_000_000: 
         return 8e-6
-    if p < 9_000_000_000:       # 4 B – 9 B
+    if p < 9_000_000_000: 
         return 6e-6
-    if p < 15_000_000_000:      # 9 B – 15 B
+    if p < 15_000_000_000:
         return 5e-6
-    if p < 40_000_000_000:      # 15 B – 40 B
+    if p < 40_000_000_000:
         return 4e-6
-    return 3e-6                 # 40 B +
+    return 3e-6           
 
 
 def _gpu_count_from_param_nums(param_nums) -> int:
     if param_nums is None:
         return 4
     p = param_nums
-    if p < 2_000_000_000:       # < 2 B
+    if p < 2_000_000_000: 
         return 1
-    if p < 6_000_000_000:       # 2 B – 6 B
+    if p < 6_000_000_000: 
         return 2
-    if p < 20_000_000_000:      # 6 B – 20 B
+    if p < 20_000_000_000:
         return 4
-    return 8                    # 20 B +
+    return 8              
 
 
 def _use_lora_from_param_nums(param_nums) -> bool:
@@ -70,15 +70,15 @@ def _vllm_mem_from_param_nums(param_nums) -> float:
     if param_nums is None:
         return 0.3
     p = param_nums
-    if p < 6_000_000_000:       # < 6 B
+    if p < 6_000_000_000: 
         return 0.3
-    if p < 9_000_000_000:       # 6 B – 9 B  — model+LoRA+optimizer leaves ~30 % free
+    if p < 9_000_000_000: 
         return 0.3
-    if p < 12_000_000_000:      # 9 B – 12 B
+    if p < 12_000_000_000:
         return 0.4
-    if p < 15_000_000_000:      # 12 B – 15 B
+    if p < 15_000_000_000:
         return 0.5
-    return 0.4                  # 15 B + (vllm likely disabled anyway)
+    return 0.4            
 
 
 def _use_4bit_from_param_nums(param_nums) -> bool:
@@ -91,17 +91,17 @@ def _slow_reward_bs_from_param_nums(param_nums) -> int:
     if param_nums is None:
         return 8
     p = param_nums
-    if p < 1_000_000_000:       # < 1 B
+    if p < 1_000_000_000: 
         return 8
-    if p < 2_000_000_000:       # 1 B – 2 B
+    if p < 2_000_000_000: 
         return 10
-    if p < 12_000_000_000:      # 2 B – 12 B
+    if p < 12_000_000_000:
         return 16
-    if p < 20_000_000_000:      # 12 B – 20 B
+    if p < 20_000_000_000:
         return 2
-    if p < 40_000_000_000:      # 20 B – 40 B (4-bit)
+    if p < 40_000_000_000:
         return 16
-    return 2                    # 40 B +
+    return 2              
 
 
 def if_contain_slow_reward_function(dataset_type: dict) -> bool:
