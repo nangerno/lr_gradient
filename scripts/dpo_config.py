@@ -146,7 +146,7 @@ def get_training_json(train_info: dict) -> dict:
         "epoch_num": 3,
         "batch_size": _bs_from_param_nums(param_nums),
         "learning_rate": _lr_from_param_nums(param_nums),
-        "min_lr_rate": 0.25,
+        "min_lr_rate": 0.1,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
         "use_lora": _use_lora_from_param_nums(param_nums),

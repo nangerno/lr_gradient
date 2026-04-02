@@ -68,17 +68,17 @@ def _use_lora_from_param_nums(param_nums) -> bool:
 
 def _vllm_mem_from_param_nums(param_nums) -> float:
     if param_nums is None:
-        return 0.4
+        return 0.3
     p = param_nums
     if p < 6_000_000_000:       # < 6 B
-        return 0.4
-    if p < 9_000_000_000:       # 6 B – 9 B
-        return 0.5
+        return 0.3
+    if p < 9_000_000_000:       # 6 B – 9 B  — model+LoRA+optimizer leaves ~30 % free
+        return 0.3
     if p < 12_000_000_000:      # 9 B – 12 B
-        return 0.6
+        return 0.4
     if p < 15_000_000_000:      # 12 B – 15 B
-        return 0.8
-    return 0.6                  # 15 B + (vllm likely disabled anyway)
+        return 0.5
+    return 0.4                  # 15 B + (vllm likely disabled anyway)
 
 
 def _use_4bit_from_param_nums(param_nums) -> bool:
@@ -235,16 +235,6 @@ def get_training_json(train_info: dict) -> dict:
         "use_4bit": _use_4bit_from_param_nums(param_nums),
     }
 
-    # Disable vllm for large models that don't have enough GPU headroom
-    if param_nums is not None and param_nums >= 15_000_000_000:
-        run_config["use_vllm"] = False
-
-    if model_name == "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5":
-        run_config["use_lora"] = True
-
-    if "starcoder" in model_name.lower():
-        run_config["batch_size"] = max(1, int(run_config["batch_size"] / 1.5))
-
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
@@ -254,8 +244,6 @@ def get_training_json(train_info: dict) -> dict:
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12
         run_config["batch_size"] = _slow_reward_bs_from_param_nums(param_nums)
-        if model_name == "unsloth/gemma-2-9b-it":
-            run_config["batch_size"] = 8
 
     # 🔁 Recompute gradient accumulation after batch size is finalised
     total_batch_size = run_config["batch_size"] * run_config["gpu_nums"]

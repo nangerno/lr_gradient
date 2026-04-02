@@ -78,17 +78,19 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
+    # Use (\s+|$) so the pattern matches even when the arg is at end of string.
+    match = re.search(f"(?P<p>--{arg_name}(\\s+)([^\\s]+))(\\s+|$)", cmd)
     if match:
         left_index = match.start("p")
         right_index = match.end("p")
         return cmd[:left_index] + f" --{arg_name} {arg_value} " + cmd[right_index:]
     else:
-        return None
+        print(f"[WARN] replace_args_in_cmd: --{arg_name} not found in command", flush=True)
+        return cmd  # return original command unchanged rather than None
 
 
 def extract_value_from_cmd(cmd: str, arg_name: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
+    match = re.search(f"(?P<p>--{arg_name}(\\s+)(?P<value>[^\\s]+))(\\s+|$)", cmd)
     if match:
         return match.group("value")
     else:
@@ -118,6 +120,9 @@ def is_openai_model(model_name: str) -> bool:
 OOM_ERROR = "torch.OutOfMemoryError: CUDA out of memory"
 VLLM_OOM_ERROR = "ValueError: No available memory for the cache blocks"
 
+# Maximum number of task-level fallback attempts after all inner retries fail.
+MAX_TASK_FALLBACKS = 3
+
 
 def get_error_type(log_path: str):
     with open(log_path, "r") as f:
@@ -128,6 +133,51 @@ def get_error_type(log_path: str):
         return VLLM_OOM_ERROR
     else:
         return None
+
+
+def _next_task_fallback(
+    train_cmd: str, task_type: str, fallback_num: int
+) -> tuple:
+    strategies = []
+
+    # Strategy 0: halve batch size
+    bs_str = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
+    if bs_str and int(bs_str) > 1:
+        strategies.append("reduce_batch")
+
+    # Strategy 1: disable vLLM (GRPO only, and only when it is currently on)
+    if task_type == TaskType.GRPOTASK.value:
+        vllm_val = extract_value_from_cmd(train_cmd, "use_vllm")
+        if vllm_val and vllm_val.lower() != "false":
+            strategies.append("disable_vllm")
+
+    # Strategy 2: enable 4-bit quant (only when not already active)
+    if "--load_in_4bit" not in train_cmd:
+        strategies.append("use_4bit")
+
+    if fallback_num >= len(strategies):
+        return None, ""
+
+    strategy = strategies[fallback_num]
+
+    if strategy == "reduce_batch":
+        bs = int(bs_str)
+        new_bs = max(1, bs // 2)
+        cmd = replace_args_in_cmd(train_cmd, "per_device_train_batch_size", str(new_bs))
+        return cmd, f"halved batch size {bs} → {new_bs}"
+
+    if strategy == "disable_vllm":
+        cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+        return cmd, "disabled vLLM colocate mode"
+
+    if strategy == "use_4bit":
+        cmd = (
+            train_cmd
+            + " --load_in_4bit True --use_bnb_nested_quant True --bnb_4bit_quant_type nf4"
+        )
+        return cmd, "enabled 4-bit NF4 quantisation"
+
+    return None, ""
 
 
 def extract_output_dir(train_cmd: str) -> str:
@@ -145,14 +195,13 @@ def run_training(
     retries: int,
     task_type: str,
     expected_repo_name: str,
-):
+) -> tuple:
     for i in range(retries):
         print(
             f"************* Training attempt {i+1}/{retries} for task {task_id}*************",
             flush=True,
         )
-        if i > 0:  # there was something wrong so we will reduce the batch_size
-            # first check if the training is OOM
+        if i > 0:
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
                 if error_type == OOM_ERROR:
@@ -163,7 +212,7 @@ def run_training(
                     if current_batch_size > 1:
                         new_batch_size = current_batch_size // 2
                         print(
-                            f"Reducing batch size from {current_batch_size} to {new_batch_size}",
+                            f"CUDA OOM — reducing batch size {current_batch_size} → {new_batch_size}",
                             flush=True,
                         )
                         train_cmd = replace_args_in_cmd(
@@ -171,21 +220,27 @@ def run_training(
                             "per_device_train_batch_size",
                             str(new_batch_size),
                         )
-                        # print(f"New train command: {train_cmd}", flush=True)
                     else:
-                        print(f"batch size is 1, cannot reduce further", flush=True)
+                        print(
+                            "CUDA OOM — batch size already 1, cannot reduce further",
+                            flush=True,
+                        )
                         if task_type == TaskType.GRPOTASK.value:
-                            # disable vllm
+                            print("Disabling vLLM colocate mode", flush=True)
                             train_cmd = replace_args_in_cmd(
                                 train_cmd, "use_vllm", "False"
                             )
-                            # print(f"disable VLLM {train_cmd}", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
-                        print(f"VLLM OOM error, disable VLLM", flush=True)
+                        print("vLLM OOM — disabling vLLM colocate mode", flush=True)
                         train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                else:
+                    print(
+                        f"Unknown error on attempt {i}/{retries}, retrying with same config",
+                        flush=True,
+                    )
 
-        # empty the log file if it exists
+        # Clear the log so the next get_error_type call reads fresh output.
         if os.path.exists(log_path):
             with open(log_path, "w") as f:
                 f.write("STARTING TRAINING")
@@ -197,12 +252,12 @@ def run_training(
         }
 
         run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars)
-        # check if training is successfully here so we can break the loop; if output_dir contains file: "successs.txt" return true
         output_dir = extract_value_from_cmd(train_cmd, "output_dir")
-        if os.path.exists(os.path.join(output_dir, "success.txt")):
-            return True
+        if output_dir and os.path.exists(os.path.join(output_dir, "success.txt")):
+            return True, train_cmd
         time.sleep(5)
-    return False
+
+    return False, train_cmd
 
 
 def patch_wandb_symlinks(base_dir: str):
@@ -476,8 +531,7 @@ def main():
             set_state(state)
             
             log_path = state["train"]["log_path"]
-            # print(f"Run training with train_info: {c_train_info}", flush=True)
-            success = run_training(
+            success, train_cmd = run_training(
                 train_cmd,
                 log_path,
                 args.task_id,
@@ -486,9 +540,56 @@ def main():
                 args.expected_repo_name,
             )
             time.sleep(5)
+
+            # ------------------------------------------------------------------ #
+            # Task-level fallback: if all inner retries failed, try progressively
+            # degraded configurations before giving up on this task entirely.
+            # ------------------------------------------------------------------ #
             if not success:
-                print(f"Training failed for task {args.task_id} at count={count}", flush=True)
-                break 
+                print(
+                    f"All inner retries failed for task {args.task_id} "
+                    f"(count={count}). Attempting task-level fallbacks …",
+                    flush=True,
+                )
+                for fb_num in range(MAX_TASK_FALLBACKS):
+                    fb_cmd, fb_desc = _next_task_fallback(
+                        train_cmd, args.task_type, fb_num
+                    )
+                    if fb_cmd is None:
+                        print(
+                            "No more task-level fallback strategies available.",
+                            flush=True,
+                        )
+                        break
+                    print(
+                        f"Task fallback {fb_num + 1}/{MAX_TASK_FALLBACKS}: {fb_desc}",
+                        flush=True,
+                    )
+                    # Update output_dir so each fallback run goes to its own dir.
+                    fb_output_dir = output_dir + f"_{count}_fb{fb_num}"
+                    fb_cmd = replace_args_in_cmd(fb_cmd, "output_dir", fb_output_dir)
+                    success, train_cmd = run_training(
+                        fb_cmd,
+                        log_path,
+                        args.task_id,
+                        args.retries,
+                        args.task_type,
+                        args.expected_repo_name,
+                    )
+                    if success:
+                        print(
+                            f"Task fallback {fb_num + 1} succeeded.", flush=True
+                        )
+                        break
+                    time.sleep(5)
+
+            if not success:
+                print(
+                    f"Training failed for task {args.task_id} at count={count} "
+                    f"after all retries and fallbacks.",
+                    flush=True,
+                )
+                break
         
         count += 1
 
