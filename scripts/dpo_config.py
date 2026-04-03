@@ -204,7 +204,7 @@ def get_training_json(train_info: dict) -> dict:
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 200
-    train_request["checking_step"] = 60
+    train_request["periodic_save_steps"] = 150
+    train_request["checking_step"] = 50
 
     return {"train_request": train_request, "run_cmd": run_cmd}

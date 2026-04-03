@@ -43,7 +43,7 @@ def get_dpo_lr(
         dataset_path, dataset_type_dict,
         train_type="dpo",
         min_lr=5e-7,
-        max_lr=5e-5,
+        max_lr=1.5e-5,
         seq_len=512,    # DPO uses LoRA and trains on chosen/rejected pairs;
                         # 512 is safe given the halved start_batch for DPO
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
