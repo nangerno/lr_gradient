@@ -184,6 +184,11 @@ def split_dataset(
     if max_data_size > 0:
         data = data[:max_data_size]
 
+    # Scale dev size with dataset: at least 200, at most 1000, targeting 2%.
+    # Fixed 200 is too small for large datasets (poor eval signal) and too
+    # large a fraction for tiny datasets. The 1000 cap keeps eval fast.
+    dev_size = min(max(200, int(0.02 * len(data))), 1000)
+
     # Split the dataset into train and dev
     dev_items = data[:dev_size]
     train_items = data[dev_size:]

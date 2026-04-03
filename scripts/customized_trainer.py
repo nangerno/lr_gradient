@@ -1,5 +1,6 @@
 from transformers import GenerationConfig
 import datetime
+import math
 from datetime import timezone
 from transformers import (
     TrainerCallback,
@@ -35,6 +36,49 @@ LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
     
+class NaNSafeCallback(TrainerCallback):
+    """
+    Guards against NaN/Inf that arise when mask_truncated_completions=True and
+    every completion in a batch is truncated (completion_mask.sum() == 0).
+    TRL divides by that zero sum → NaN loss → NaN gradients.
+
+    Two-layer defence:
+      1. on_pre_optimizer_step — zero out NaN/Inf gradients before the
+         optimizer applies them, turning a poisoned step into a no-op.
+      2. on_log — replace any NaN/Inf float metric with 0.0 so logs stay
+         clean and downstream consumers (e.g. wandb) don't choke.
+    """
+
+    def on_pre_optimizer_step(
+        self, args, state: TrainerState, control: TrainerControl, **kwargs
+    ):
+        model = kwargs.get("model")
+        if model is None:
+            return
+        nan_params = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                bad = torch.isnan(p.grad) | torch.isinf(p.grad)
+                if bad.any():
+                    p.grad.zero_()
+                    nan_params += 1
+        if nan_params:
+            print(
+                f"[NaNSafeCallback] step {state.global_step}: zeroed NaN/Inf "
+                f"gradients in {nan_params} parameter tensor(s).",
+                flush=True,
+            )
+
+    def on_log(
+        self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs
+    ):
+        if not logs:
+            return
+        for key, value in logs.items():
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                logs[key] = 0.0
+
+
 class CustomEvalSaveCallback(TrainerCallback):
     def __init__(
         self,

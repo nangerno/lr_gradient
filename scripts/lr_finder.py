@@ -133,6 +133,7 @@ def _micro_train(
     text_key: str,
     steps: int,
     device: str,
+    seq_len: int = 512,
 ) -> float:
     """Generic causal-LM micro-training used for instruct, grpo, and dpo."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -146,8 +147,10 @@ def _micro_train(
         optimizer.zero_grad()
 
         texts = batch[text_key]
+        # Truncate to seq_len so memory usage matches the find_max_batch_size probe.
         inputs = tokenizer(
-            texts, return_tensors="pt", truncation=True, padding=True
+            texts, return_tensors="pt", truncation=True, padding=True,
+            max_length=seq_len,
         ).to(device)
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -177,11 +180,12 @@ def _pick_best_lr(
     text_key: str,
     steps: int,
     device: str,
+    seq_len: int = 512,
 ) -> float:
     lr_losses: dict[float, float] = {}
     for lr in lr_candidates:
         print(f"  [LR Finder] Testing LR {lr:.2e} ...", flush=True)
-        loss = _micro_train(model, tokenizer, dataloader, lr, text_key, steps, device)
+        loss = _micro_train(model, tokenizer, dataloader, lr, text_key, steps, device, seq_len=seq_len)
         lr_losses[lr] = loss
         print(f"    avg loss = {loss:.4f}", flush=True)
 
@@ -209,6 +213,7 @@ def _run_with_auto_batch(
     train_type: str,
     steps: int,
     device: str,
+    seq_len: int = 512,
 ) -> float:
     # DPO processes two sequences per sample, so start smaller.
     start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
@@ -217,7 +222,7 @@ def _run_with_auto_batch(
     while batch_size >= 1:
         try:
             dl = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-            return _pick_best_lr(model, tokenizer, dl, lr_candidates, text_key, steps, device)
+            return _pick_best_lr(model, tokenizer, dl, lr_candidates, text_key, steps, device, seq_len=seq_len)
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 print(
@@ -393,6 +398,7 @@ def find_lr(
             model, tokenizer, sample_ds,
             safe_batch, lr_candidates, text_key,
             train_type, steps, device,
+            seq_len=seq_len,
         )
 
         print(f"[LR Finder] Selected LR: {best_lr:.2e}", flush=True)

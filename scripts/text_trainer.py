@@ -153,6 +153,12 @@ def _next_task_fallback(
     if strategy == "reduce_batch":
         bs = int(bs_str)
         new_bs = max(1, bs // 2)
+        # For GRPO, keep new_bs divisible by num_generations.
+        if task_type == TaskType.GRPOTASK.value:
+            num_gen_str = extract_value_from_cmd(train_cmd, "num_generations")
+            num_gen = int(num_gen_str) if num_gen_str else 2
+            if num_gen > 1 and new_bs % num_gen != 0:
+                new_bs = max(num_gen, (new_bs // num_gen) * num_gen)
         cmd = replace_args_in_cmd(train_cmd, "per_device_train_batch_size", str(new_bs))
         return cmd, f"halved batch size {bs} → {new_bs}"
 
@@ -204,6 +210,12 @@ def run_training(
                     current_batch_size = int(current_batch_size)
                     if current_batch_size > 1:
                         new_batch_size = current_batch_size // 2
+                        # For GRPO, keep new_batch_size divisible by num_generations.
+                        if task_type == TaskType.GRPOTASK.value:
+                            num_gen_str = extract_value_from_cmd(train_cmd, "num_generations")
+                            num_gen = int(num_gen_str) if num_gen_str else 2
+                            if num_gen > 1 and new_batch_size % num_gen != 0:
+                                new_batch_size = max(num_gen, (new_batch_size // num_gen) * num_gen)
                         print(
                             f"CUDA OOM — reducing batch size {current_batch_size} → {new_batch_size}",
                             flush=True,

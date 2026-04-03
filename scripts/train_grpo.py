@@ -28,7 +28,7 @@ import traceback
 from transformers import TrainerCallback
 import argparse
 import math
-from customized_trainer import resize_if_needed, set_generation_config, GRPOCustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import resize_if_needed, set_generation_config, GRPOCustomEvalSaveCallback, WhenToEvalHandler, init_wandb, NaNSafeCallback
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 import os
 import glob
@@ -463,6 +463,7 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
         callbacks=[
+            NaNSafeCallback(),
             GRPOCustomEvalSaveCallback(
                 WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],

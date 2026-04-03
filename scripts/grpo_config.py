@@ -141,6 +141,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "optimizer",
         "vllm_gpu_memory_utilization",
         "num_generations",
+        "max_completion_length",
         "disable_fa",
     ]
     for key in required_keys:
@@ -177,6 +178,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --gradient_checkpointing {gradient_checkpointing} \
     --optim {optimizer} \
     --use_liger {use_liger} --num_generations {num_generations} --vllm_mode colocate --vllm_gpu_memory_utilization {vllm_gpu_memory_utilization} \
+    --max_completion_length {max_completion_length} --mask_truncated_completions True \
     --disable_fa {disable_fa}"""
     )
 
@@ -229,7 +231,8 @@ def get_training_json(train_info: dict) -> dict:
         "gradient_checkpointing": get_gradient_checkpointing(model_name),
         "gradient_accumulation_steps": 4,
         "vllm_gpu_memory_utilization": _vllm_mem_from_param_nums(param_nums),
-        "num_generations": 2,
+        "num_generations": 4,
+        "max_completion_length": 512,
         "use_vllm": get_use_vllm(model_architecture, model_name),
         "tensor_parallel": False,
         "use_4bit": _use_4bit_from_param_nums(param_nums),
@@ -282,6 +285,19 @@ def get_training_json(train_info: dict) -> dict:
                 run_config["batch_size"] = bs
         else:
             print(f"LR finder failed, using param-based fallback: {run_config['learning_rate']}", flush=True)
+
+    # GRPO requires effective_batch_size % num_generations == 0.
+    # Snap the batch size down to the nearest valid multiple.
+    num_gen = run_config["num_generations"]
+    bs = run_config["batch_size"]
+    if num_gen > 1 and bs % num_gen != 0:
+        snapped = max(num_gen, (bs // num_gen) * num_gen)
+        print(
+            f"Snapping batch size {bs} → {snapped} to be divisible by "
+            f"num_generations={num_gen}",
+            flush=True,
+        )
+        run_config["batch_size"] = snapped
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
 

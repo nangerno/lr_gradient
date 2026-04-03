@@ -29,6 +29,9 @@ def split_dataset(total_data_path: str, train_data_path: str, dev_data_path: str
     
     random.seed(seed)
     random.shuffle(data)
+
+    # Scale dev size with dataset: at least 200, at most 1000, targeting 2%.
+    dev_size = min(max(200, int(0.02 * len(data))), 1000)
     
     # Split the dataset into train and dev
     dev_items = data[:dev_size]
