@@ -299,7 +299,7 @@ def find_lr(
     train_type: str = "instruct",
     min_lr: float = 6e-6,
     max_lr: float = 1e-2,
-    lr_points: int = 15,
+    lr_points: int = 18,
     steps: int = 20,
     seq_len: int = 512,
     # LoRA config — should match the actual training setup for this task so

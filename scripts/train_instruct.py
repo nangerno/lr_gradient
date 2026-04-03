@@ -7,7 +7,7 @@ import transformers
 import torch
 from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import resize_if_needed, set_generation_config, InstructCustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 
 import os
 import datetime
@@ -371,7 +371,7 @@ def main():
         train_dataset=train_ds,
         eval_dataset=dev_ds,
         callbacks=[
-            CustomEvalSaveCallback(
+            InstructCustomEvalSaveCallback(
                 WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
