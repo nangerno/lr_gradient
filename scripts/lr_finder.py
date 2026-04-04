@@ -287,7 +287,7 @@ def _load_sample_dataset(
     data = list(ds)
     random.seed(42)
     random.shuffle(data)
-    sample_count = max(200, int(len(data) * 0.01))
+    sample_count = max(200, int(len(data) * 0.02))
     return Dataset.from_list(data[:sample_count]), text_key
 
 
