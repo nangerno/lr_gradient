@@ -125,6 +125,38 @@ def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
 # Micro-training kernels
 # --------------------------------------------------------------------------- #
 
+def _trainable_params(model) -> list[torch.nn.Parameter]:
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _make_optimizer(
+    model,
+    lr: float,
+    optimizer_name: Optional[str],
+    weight_decay: float = 0.0,
+):
+    """Match training optim when possible; fall back to AdamW on trainable params only."""
+    params = _trainable_params(model)
+    key = (optimizer_name or "adamw_torch").lower().replace("-", "_")
+    if key in ("paged_adamw_8bit", "pagedadamw8bit"):
+        try:
+            import bitsandbytes as bnb
+
+            return bnb.optim.PagedAdamW8bit(
+                params,
+                lr=lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=weight_decay,
+            )
+        except Exception as exc:
+            print(
+                f"[LR Finder] PagedAdamW8bit unavailable ({exc}); using AdamW.",
+                flush=True,
+            )
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+
 def _micro_train(
     model,
     tokenizer,
@@ -134,9 +166,11 @@ def _micro_train(
     steps: int,
     device: str,
     seq_len: int = 512,
+    optimizer_name: Optional[str] = None,
 ) -> float:
     """Generic causal-LM micro-training used for instruct, grpo, and dpo."""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = _make_optimizer(model, lr, optimizer_name)
+    trainable = _trainable_params(model)
     model.train()
     losses: list[float] = []
 
@@ -162,7 +196,7 @@ def _micro_train(
 
         losses.append(loss.item())
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         optimizer.step()
 
         # Early-stop if loss diverges sharply
@@ -181,6 +215,7 @@ def _pick_best_lr(
     steps: int,
     device: str,
     seq_len: int = 512,
+    optimizer_name: Optional[str] = None,
 ) -> float:
     # Reset trainable weights before each LR so probes do not compound on prior steps.
     trainable_snapshot = {
@@ -199,7 +234,17 @@ def _pick_best_lr(
     for lr in lr_candidates:
         _restore_trainable_weights()
         print(f"  [LR Finder] Testing LR {lr:.2e} ...", flush=True)
-        loss = _micro_train(model, tokenizer, dataloader, lr, text_key, steps, device, seq_len=seq_len)
+        loss = _micro_train(
+            model,
+            tokenizer,
+            dataloader,
+            lr,
+            text_key,
+            steps,
+            device,
+            seq_len=seq_len,
+            optimizer_name=optimizer_name,
+        )
         lr_losses[lr] = loss
         print(f"    avg loss = {loss:.4f}", flush=True)
 
@@ -228,6 +273,7 @@ def _run_with_auto_batch(
     steps: int,
     device: str,
     seq_len: int = 512,
+    optimizer_name: Optional[str] = None,
 ) -> tuple[float, int]:
     # DPO processes two sequences per sample, so start smaller.
     start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
@@ -239,7 +285,15 @@ def _run_with_auto_batch(
             # identical across LR candidates so losses are comparable.
             dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
             best_lr = _pick_best_lr(
-                model, tokenizer, dl, lr_candidates, text_key, steps, device, seq_len=seq_len
+                model,
+                tokenizer,
+                dl,
+                lr_candidates,
+                text_key,
+                steps,
+                device,
+                seq_len=seq_len,
+                optimizer_name=optimizer_name,
             )
             return best_lr, batch_size
         except RuntimeError as exc:
@@ -323,7 +377,7 @@ def find_lr(
     train_type: str = "instruct",
     min_lr: float = 6e-6,
     max_lr: float = 1e-3,
-    lr_points: int = 18,
+    lr_points: int = 30,
     steps: int = 20,
     seq_len: int = 512,
     # LoRA config — should match the actual training setup for this task so
@@ -333,6 +387,8 @@ def find_lr(
     lora_r: int = _DEFAULT_LORA_R,
     lora_alpha: int = _DEFAULT_LORA_ALPHA,
     lora_dropout: float = _DEFAULT_LORA_DROPOUT,
+    # e.g. "paged_adamw_8bit" to match GRPO/SFT training; None → AdamW on trainable only.
+    optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
@@ -341,10 +397,12 @@ def find_lr(
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    _opt_disp = optimizer_name or "adamw_torch"
     print(
         f"[LR Finder] model={model_id}  type={train_type}  "
         f"params={num_params}  lora={use_lora}"
-        + (f"  lora_r={lora_r}" if use_lora else ""),
+        + (f"  lora_r={lora_r}" if use_lora else "")
+        + f"  optim={_opt_disp}  micro_steps={steps}  lr_points={lr_points}",
         flush=True,
     )
 
@@ -414,10 +472,17 @@ def find_lr(
         )
 
         best_lr, probe_batch = _run_with_auto_batch(
-            model, tokenizer, sample_ds,
-            safe_batch, lr_candidates, text_key,
-            train_type, steps, device,
+            model,
+            tokenizer,
+            sample_ds,
+            safe_batch,
+            lr_candidates,
+            text_key,
+            train_type,
+            steps,
+            device,
             seq_len=seq_len,
+            optimizer_name=optimizer_name,
         )
 
         print(

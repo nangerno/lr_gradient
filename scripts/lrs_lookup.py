@@ -6,6 +6,14 @@ _DPO_GRPO_LORA_R         = 128
 _DPO_GRPO_LORA_ALPHA     = 256
 _DPO_GRPO_LORA_DROPOUT   = 0.05
 
+_GRPO_PROBE_SEQ_CAP = 8192
+
+
+def _grpo_probe_seq_len(max_prompt_length: int, max_completion_length: int) -> int:
+    """Upper-bound token length for LR probe (aligns batch + micro-train with GRPO training)."""
+    total = max(1, int(max_prompt_length) + int(max_completion_length))
+    return min(total, _GRPO_PROBE_SEQ_CAP)
+
 
 def get_instruct_lr(
     model_id: str,
@@ -23,8 +31,7 @@ def get_instruct_lr(
         min_lr=1e-6,
         max_lr=9e-3,
         steps=40,
-        seq_len=1024,   # instruct trains on prompt+response, typically up to 2048 tokens;
-                        # 1024 is a realistic probe length that avoids 4× OOM mismatch
+        seq_len=1024,
         lora_threshold=None,
     )
 
@@ -44,8 +51,7 @@ def get_dpo_lr(
         train_type="dpo",
         min_lr=1e-7,
         max_lr=9e-4,
-        seq_len=512,    # DPO uses LoRA and trains on chosen/rejected pairs;
-                        # 512 is safe given the halved start_batch for DPO
+        seq_len=512,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
@@ -59,16 +65,31 @@ def get_grpo_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
+    *,
+    max_prompt_length: int = 512,
+    max_completion_length: int = 512,
+    steps: int = 40,
+    lr_points: int = 30,
+    optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
+    seq_len = _grpo_probe_seq_len(max_prompt_length, max_completion_length)
+    print(
+        f"[LR Finder] GRPO probe seq_len={seq_len} "
+        f"(max_prompt={max_prompt_length} + max_completion={max_completion_length})",
+        flush=True,
+    )
     return find_lr(
         model_id, model_path, num_params,
         dataset_path, dataset_type_dict,
         train_type="grpo",
         min_lr=1e-5,
         max_lr=9e-4,
-        seq_len=512,    # GRPO only processes prompts; max_prompt_length=512
+        seq_len=seq_len,
+        steps=steps,
+        lr_points=lr_points,
+        optimizer_name=optimizer_name,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
@@ -82,16 +103,31 @@ def get_grpo_python_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
+    *,
+    max_prompt_length: int = 512,
+    max_completion_length: int = 512,
+    steps: int = 40,
+    lr_points: int = 30,
+    optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
+    seq_len = _grpo_probe_seq_len(max_prompt_length, max_completion_length)
+    print(
+        f"[LR Finder] GRPO probe seq_len={seq_len} "
+        f"(max_prompt={max_prompt_length} + max_completion={max_completion_length})",
+        flush=True,
+    )
     return find_lr(
         model_id, model_path, num_params,
         dataset_path, dataset_type_dict,
         train_type="grpo",
         min_lr=1e-6,
         max_lr=9e-3,
-        seq_len=512,    # GRPO only processes prompts; max_prompt_length=512
+        seq_len=seq_len,
+        steps=steps,
+        lr_points=lr_points,
+        optimizer_name=optimizer_name,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,

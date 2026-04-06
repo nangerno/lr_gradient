@@ -222,10 +222,13 @@ def get_training_json(train_info: dict) -> dict:
         "gradient_accumulation_steps": 4,
         "vllm_gpu_memory_utilization": _vllm_mem_from_param_nums(param_nums),
         "num_generations": 4,
-        "max_completion_length": 512,
+        "max_completion_length": 256,
         "use_vllm": False if gpu_nums <= 1 else get_use_vllm(model_architecture, model_name),
         "tensor_parallel": False,
         "use_4bit": _use_4bit_from_param_nums(param_nums),
+        # LR finder micro-train (align with instruct-style probe depth + training optim).
+        "lr_finder_steps": 40,
+        "lr_finder_points": 30,
     }
 
     train_request = deepcopy(train_info)
@@ -237,28 +240,46 @@ def get_training_json(train_info: dict) -> dict:
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12
         run_config["batch_size"] = _slow_reward_bs_from_param_nums(param_nums)
-
-    # Keep scheduling math safe even when GPU auto-detection fails.
-    effective_gpu_nums = max(1, run_config["gpu_nums"])
-    total_batch_size = run_config["batch_size"] * effective_gpu_nums
-    if total_batch_size < 64:
-        run_config["gradient_accumulation_steps"] = max(1, 64 // total_batch_size)
-    else:
-        run_config["gradient_accumulation_steps"] = 1
-
-    run_config["eval_batch_size"] = 4
-    if run_config["batch_size"] <= 4:
-        run_config["eval_batch_size"] = 2
+        run_config["max_completion_length"] = 128
+        print(
+            "Slow reward functions (e.g. textstat/langcheck/detoxify): "
+            "max_completion_length=128 to shorten generation and reward cost.",
+            flush=True,
+        )
 
     if train_info["find_lk_lr"]:
         dataset_path = train_info.get("dataset", "")
         dataset_type_dict = train_info.get("dataset_type", {})
         has_python_execution = contain_python_execution(train_info["dataset_type"])
+        max_prompt_length = int(train_info.get("max_prompt_length", 512))
+        max_completion_length = int(run_config["max_completion_length"])
 
         if not has_python_execution:
-            lr_result = get_grpo_lr(model_name, model_path, param_nums, dataset_path, dataset_type_dict)
+            lr_result = get_grpo_lr(
+                model_name,
+                model_path,
+                param_nums,
+                dataset_path,
+                dataset_type_dict,
+                max_prompt_length=max_prompt_length,
+                max_completion_length=max_completion_length,
+                steps=run_config["lr_finder_steps"],
+                lr_points=run_config["lr_finder_points"],
+                optimizer_name=run_config["optimizer"],
+            )
         else:
-            lr_result = get_grpo_python_lr(model_name, model_path, param_nums, dataset_path, dataset_type_dict)
+            lr_result = get_grpo_python_lr(
+                model_name,
+                model_path,
+                param_nums,
+                dataset_path,
+                dataset_type_dict,
+                max_prompt_length=max_prompt_length,
+                max_completion_length=max_completion_length,
+                steps=run_config["lr_finder_steps"],
+                lr_points=run_config["lr_finder_points"],
+                optimizer_name=run_config["optimizer"],
+            )
 
         if lr_result is not None:
             lr = lr_result.get("lr")
@@ -288,6 +309,18 @@ def get_training_json(train_info: dict) -> dict:
             flush=True,
         )
         run_config["batch_size"] = snapped
+
+    # After final batch_size (slow rewards, LR finder, num_generations snap).
+    effective_gpu_nums = max(1, run_config["gpu_nums"])
+    total_batch_size = run_config["batch_size"] * effective_gpu_nums
+    if total_batch_size < 64:
+        run_config["gradient_accumulation_steps"] = max(1, 64 // total_batch_size)
+    else:
+        run_config["gradient_accumulation_steps"] = 1
+
+    run_config["eval_batch_size"] = 4
+    if run_config["batch_size"] <= 4:
+        run_config["eval_batch_size"] = 2
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
 
