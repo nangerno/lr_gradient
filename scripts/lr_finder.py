@@ -182,6 +182,7 @@ def _pick_best_lr(
     device: str,
     seq_len: int = 512,
 ) -> float:
+    # Reset trainable weights before each LR so probes do not compound on prior steps.
     trainable_snapshot = {
         name: param.detach().clone()
         for name, param in model.named_parameters()
@@ -227,15 +228,20 @@ def _run_with_auto_batch(
     steps: int,
     device: str,
     seq_len: int = 512,
-) -> float:
+) -> tuple[float, int]:
     # DPO processes two sequences per sample, so start smaller.
     start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
     batch_size = start_batch
 
     while batch_size >= 1:
         try:
-            dl = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-            return _pick_best_lr(model, tokenizer, dl, lr_candidates, text_key, steps, device, seq_len=seq_len)
+            # shuffle=False: _load_sample_dataset already shuffled; keeps batch order
+            # identical across LR candidates so losses are comparable.
+            dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            best_lr = _pick_best_lr(
+                model, tokenizer, dl, lr_candidates, text_key, steps, device, seq_len=seq_len
+            )
+            return best_lr, batch_size
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 print(
@@ -251,7 +257,7 @@ def _run_with_auto_batch(
 
 
 # --------------------------------------------------------------------------- #
-# Dataset loading — 1 % sample
+# Dataset loading — shuffled subset for probing
 # --------------------------------------------------------------------------- #
 
 def _load_sample_dataset(
@@ -261,7 +267,7 @@ def _load_sample_dataset(
 ) -> tuple[Dataset, str]:
     """
     Load the raw JSON dataset, extract the relevant text column, then return
-    a 1 %-sample Dataset together with the name of the text column.
+    a shuffled subset (~2 %, min 200 rows) together with the text column name.
     """
     raw = load_dataset("json", data_files=dataset_path)["train"]
 
@@ -295,7 +301,7 @@ def _load_sample_dataset(
         ds = raw.map(_map_instruct, remove_columns=raw.column_names)
         text_key = "text"
 
-    # Shuffle and take 1 % — floor at 200 so the probe is never too noisy on
+    # Shuffle and take ~2 % (floor 200 examples) so the probe is not too noisy on
     # small datasets (e.g. 5 k examples → 50 samples was not enough signal).
     data = list(ds)
     random.seed(42)
@@ -394,7 +400,7 @@ def find_lr(
         # ------------------------------------------------------------------ #
         # Load 1 % dataset sample
         # ------------------------------------------------------------------ #
-        print(f"[LR Finder] Loading 1 % of {dataset_path} …", flush=True)
+        print(f"[LR Finder] Loading sample subset of {dataset_path} …", flush=True)
         sample_ds, text_key = _load_sample_dataset(dataset_path, dataset_type_dict, train_type)
         print(f"[LR Finder] Sample size: {len(sample_ds)} examples", flush=True)
 
@@ -407,18 +413,23 @@ def find_lr(
             flush=True,
         )
 
-        best_lr = _run_with_auto_batch(
+        best_lr, probe_batch = _run_with_auto_batch(
             model, tokenizer, sample_ds,
             safe_batch, lr_candidates, text_key,
             train_type, steps, device,
             seq_len=seq_len,
         )
 
-        print(f"[LR Finder] Selected LR: {best_lr:.2e}", flush=True)
-        # return best_lr
+        print(
+            f"[LR Finder] Selected LR: {best_lr:.2e}  "
+            f"(micro-train batch_size={probe_batch}; synthetic safe_batch={safe_batch})",
+            flush=True,
+        )
         return {
             "lr": best_lr,
-            "batch_size": safe_batch
+            # Batch size used during the LR sweep — not safe_batch from the synthetic probe,
+            # which can be 2–4× larger and was never validated with real tokenizer + data.
+            "batch_size": probe_batch,
         }
 
     except Exception as exc:
