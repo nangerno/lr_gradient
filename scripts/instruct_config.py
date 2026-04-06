@@ -20,12 +20,16 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "use_lora",
         "packing",
         "disable_fa",
+        "distributed",
+        "gradient_checkpointing",
+        "gradient_accumulation_steps",
+        "output_dir",
+        "request_path",
     ]
     for key in required_keys:
         if key not in config:
             raise ValueError(f"Required key {key} not found in config")
 
-    gpu_nums = get_gpu_count()
     start_cmd = "python"
     run_type = config["distributed"]
 
@@ -58,7 +62,8 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --gradient_checkpointing {gradient_checkpointing} \
     --optim {optimizer} \
     --use_liger {use_liger} \
-    --packing {packing} --disable_fa {disable_fa}"""
+    --packing {packing} \
+    --disable_fa {disable_fa}"""
     )
 
     if run_type == "ds":
@@ -119,7 +124,6 @@ def get_training_json(train_info: dict) -> dict:
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
 
-    # 🔧 Default fallback config (used if LR finder fails)
     run_config = {
         "epoch_num": 3,
         "batch_size": _bs_from_param_nums(param_nums),
@@ -129,12 +133,12 @@ def get_training_json(train_info: dict) -> dict:
         "optimizer": "paged_adamw_8bit",
         "use_lora": False,
         "disable_fa": disable_flash_attention(model_architecture, model_name),
-        "packing": "True",
+        "packing": True,
         "gpu_nums": get_gpu_count(),
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": "ddp",
-        "gradient_checkpointing": "True",
+        "gradient_checkpointing": True,
         "gradient_accumulation_steps": 4,
         "use_attn_implementation": (
             "kernels-community/vllm-flash-attn3"
@@ -143,7 +147,6 @@ def get_training_json(train_info: dict) -> dict:
         ),
     }
 
-    # 🚀 DYNAMIC LR + BATCH SIZE
     if train_info["find_lk_lr"]:
         dataset_path = train_info.get("dataset", "")
         dataset_type_dict = train_info.get("dataset_type", {})
@@ -174,24 +177,23 @@ def get_training_json(train_info: dict) -> dict:
         else:
             print(f"LR finder failed, using param-based fallback: {run_config['learning_rate']}", flush=True)
 
-    # 🔁 Recompute gradient accumulation AFTER final batch size
-    data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
+    # Keep scheduling math safe even when GPU auto-detection fails.
+    effective_gpu_nums = max(1, run_config["gpu_nums"])
+    data_per_step = run_config["batch_size"] * effective_gpu_nums
 
     if data_per_step >= 64:
         run_config["gradient_accumulation_steps"] = 1
     else:
-        run_config["gradient_accumulation_steps"] = int(64 / data_per_step)
+        run_config["gradient_accumulation_steps"] = max(1, 64 // data_per_step)
 
-    # 📉 Apply regularization scaling
     run_config["learning_rate"] *= train_info["reg_ratio"]
 
-    # 🚀 Generate command
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
 
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 150
+    train_request["periodic_save_steps"] = 250
     train_request["checking_step"] = 50
 
     return {"train_request": train_request, "run_cmd": run_cmd}

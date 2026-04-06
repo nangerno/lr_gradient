@@ -43,20 +43,7 @@ def _lr_from_param_nums(param_nums) -> float:
         return 4e-6
     if p < 70_000_000_000:      
         return 3e-6
-    return 2e-6                
-
-
-def _gpu_count_from_param_nums(param_nums) -> int:
-    if param_nums is None:
-        return 4
-    p = param_nums
-    if p < 1_330_000_000:       
-        return 1
-    if p < 4_000_000_000:       
-        return 2
-    if p < 13_330_000_000:      
-        return 4
-    return 8                    
+    return 2e-6                            
 
 
 def _distributed_from_param_nums(param_nums) -> str:
@@ -80,12 +67,15 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "use_liger",
         "optimizer",
         "disable_fa",
+        "gradient_checkpointing",
+        "gradient_accumulation_steps",
+        "output_dir",
+        "request_path",
     ]
     for key in required_keys:
         if key not in config:
             raise ValueError(f"Required key {key} not found in config")
 
-    gpu_nums = get_gpu_count()
     start_cmd = "python"
     run_type = config.get("distributed", "ddp")
     if gpu_nums > 1 and run_type == "ddp":
@@ -116,7 +106,8 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --tf32 True \
     --gradient_checkpointing {gradient_checkpointing} \
     --optim {optimizer} \
-    --use_liger {use_liger} --disable_fa {disable_fa}"""
+    --use_liger {use_liger} \
+    --disable_fa {disable_fa}"""
     )
 
     if config.get("use_lora", False):
@@ -151,7 +142,7 @@ def get_training_json(train_info: dict) -> dict:
         "optimizer": "paged_adamw_8bit",
         "use_lora": _use_lora_from_param_nums(param_nums),
         "disable_fa": disable_flash_attention(model_architecture, model_name),
-        "gpu_nums": _gpu_count_from_param_nums(param_nums),
+        "gpu_nums": get_gpu_count(),
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": _distributed_from_param_nums(param_nums),
@@ -164,12 +155,6 @@ def get_training_json(train_info: dict) -> dict:
         ),
     }
 
-    # 🔁 Recompute gradient accumulation after batch size is set
-    data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
-    if data_per_step < 64:
-        run_config["gradient_accumulation_steps"] = min(4, int(64 / data_per_step))
-
-    # 🚀 DYNAMIC LR + BATCH SIZE
     if train_info["find_lk_lr"]:
         dataset_path = train_info.get("dataset", "")
         dataset_type_dict = train_info.get("dataset_type", {})
@@ -194,17 +179,23 @@ def get_training_json(train_info: dict) -> dict:
         else:
             print(f"LR finder failed, using param-based fallback: {run_config['learning_rate']}", flush=True)
 
+    # Keep scheduling math safe even when GPU auto-detection fails.
+    effective_gpu_nums = max(1, run_config["gpu_nums"])
+    data_per_step = run_config["batch_size"] * effective_gpu_nums
+    if data_per_step < 64:
+        run_config["gradient_accumulation_steps"] = min(4, int(64 / data_per_step))
+    
     run_config["learning_rate"] *= train_info["reg_ratio"]
 
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
-    if run_config["disable_fa"] == "False":
+    if run_config["disable_fa"] is False:
         run_cmd = run_cmd + " --padding_free True"
 
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 150
+    train_request["periodic_save_steps"] = 250
     train_request["checking_step"] = 50
 
     return {"train_request": train_request, "run_cmd": run_cmd}

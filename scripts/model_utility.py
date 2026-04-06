@@ -56,9 +56,9 @@ def get_use_liger(architecture: str) -> str:
         "phi3forcausallm",
         "gemmaforcausallm",
     ]:
-        return "True"
+        return True
     else:
-        return "False"
+        return False
 
 
 def count_params_from_safetensors(model_dir):
@@ -135,17 +135,18 @@ def get_model_num_params(model_id: str, model_path: str) -> int:
         return None
 
 
-def disable_flash_attention(architecture: str, model: str) -> str:
-    if model == "microsoft/phi-2":  
-        return "True"
-    if "falcon-rw" in model.lower():  # ex, tiiuae/falcon-rw-1b
-        return "True"
-    # if model == "databricks/dolly-v2-3b":
-    #    return "True"
-    if architecture.strip().lower() in ["gptneoforcausallm", "bloomforcausallm", "gptossforcausallm"]:
-        return "True"
-    else:
-        return "False"
+def disable_flash_attention(architecture: str, model: str) -> bool:
+    if model == "microsoft/phi-2":
+        return True
+    if "falcon-rw" in model.lower():
+        return True
+    if architecture.strip().lower() in [
+        "gptneoforcausallm",
+        "bloomforcausallm",
+        "gptossforcausallm",
+    ]:
+        return True
+    return False
 
 
 def get_use_vllm(architecture: str, model: str) -> str:

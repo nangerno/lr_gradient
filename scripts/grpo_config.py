@@ -47,19 +47,6 @@ def _lr_from_param_nums(param_nums) -> float:
     return 3e-6           
 
 
-def _gpu_count_from_param_nums(param_nums) -> int:
-    if param_nums is None:
-        return 4
-    p = param_nums
-    if p < 2_000_000_000: 
-        return 1
-    if p < 6_000_000_000: 
-        return 2
-    if p < 20_000_000_000:
-        return 4
-    return 8              
-
-
 def _use_lora_from_param_nums(param_nums) -> bool:
     if param_nums is None:
         return True
@@ -68,17 +55,13 @@ def _use_lora_from_param_nums(param_nums) -> bool:
 
 def _vllm_mem_from_param_nums(param_nums) -> float:
     if param_nums is None:
-        return 0.3
+        return 0.2
     p = param_nums
-    if p < 6_000_000_000: 
-        return 0.3
-    if p < 9_000_000_000: 
-        return 0.3
     if p < 12_000_000_000:
-        return 0.4
-    if p < 15_000_000_000:
-        return 0.5
-    return 0.4            
+        return 0.2
+    if p < 20_000_000_000:
+        return 0.25
+    return 0.3     
 
 
 def _use_4bit_from_param_nums(param_nums) -> bool:
@@ -143,12 +126,17 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "num_generations",
         "max_completion_length",
         "disable_fa",
+        "distributed",
+        "gradient_checkpointing",
+        "gradient_accumulation_steps",
+        "eval_batch_size",
+        "output_dir",
+        "request_path",
     ]
     for key in required_keys:
         if key not in config:
             raise ValueError(f"Required key {key} not found in config")
 
-    gpu_nums = get_gpu_count()
     start_cmd = f"torchrun --nproc_per_node={gpu_nums}"
     run_type = config["distributed"]
     if run_type == "ds":
@@ -214,7 +202,9 @@ def get_training_json(train_info: dict) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-
+    
+    gpu_nums = max(1, get_gpu_count())
+    
     run_config = {
         "epoch_num": 2,
         "batch_size": _bs_from_param_nums(param_nums),
@@ -224,7 +214,7 @@ def get_training_json(train_info: dict) -> dict:
         "optimizer": "paged_adamw_8bit",
         "use_lora": _use_lora_from_param_nums(param_nums),
         "disable_fa": disable_flash_attention(model_architecture, model_name),
-        "gpu_nums": _gpu_count_from_param_nums(param_nums),
+        "gpu_nums": gpu_nums,
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": "ddp",
@@ -233,7 +223,7 @@ def get_training_json(train_info: dict) -> dict:
         "vllm_gpu_memory_utilization": _vllm_mem_from_param_nums(param_nums),
         "num_generations": 4,
         "max_completion_length": 512,
-        "use_vllm": get_use_vllm(model_architecture, model_name),
+        "use_vllm": False if gpu_nums <= 1 else get_use_vllm(model_architecture, model_name),
         "tensor_parallel": False,
         "use_4bit": _use_4bit_from_param_nums(param_nums),
     }
@@ -242,22 +232,24 @@ def get_training_json(train_info: dict) -> dict:
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 500
+    train_request["periodic_save_steps"] = 250
 
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12
         run_config["batch_size"] = _slow_reward_bs_from_param_nums(param_nums)
 
-    # 🔁 Recompute gradient accumulation after batch size is finalised
-    total_batch_size = run_config["batch_size"] * run_config["gpu_nums"]
+    # Keep scheduling math safe even when GPU auto-detection fails.
+    effective_gpu_nums = max(1, run_config["gpu_nums"])
+    total_batch_size = run_config["batch_size"] * effective_gpu_nums
     if total_batch_size < 64:
-        run_config["gradient_accumulation_steps"] = min(4, int(64 / total_batch_size))
+        run_config["gradient_accumulation_steps"] = max(1, 64 // total_batch_size)
+    else:
+        run_config["gradient_accumulation_steps"] = 1
 
     run_config["eval_batch_size"] = 4
     if run_config["batch_size"] <= 4:
         run_config["eval_batch_size"] = 2
 
-    # 🚀 DYNAMIC LR + BATCH SIZE
     if train_info["find_lk_lr"]:
         dataset_path = train_info.get("dataset", "")
         dataset_type_dict = train_info.get("dataset_type", {})
@@ -286,8 +278,6 @@ def get_training_json(train_info: dict) -> dict:
         else:
             print(f"LR finder failed, using param-based fallback: {run_config['learning_rate']}", flush=True)
 
-    # GRPO requires effective_batch_size % num_generations == 0.
-    # Snap the batch size down to the nearest valid multiple.
     num_gen = run_config["num_generations"]
     bs = run_config["batch_size"]
     if num_gen > 1 and bs % num_gen != 0:
