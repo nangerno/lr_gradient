@@ -248,7 +248,7 @@ def _load_sample_dataset(
 ) -> tuple[Dataset, str]:
     """
     Load the raw JSON dataset, extract the relevant text column, then return
-    a 1 %-sample Dataset together with the name of the text column.
+    a 2 %-sample Dataset together with the name of the text column.
     """
     raw = load_dataset("json", data_files=dataset_path)["train"]
 
@@ -282,12 +282,12 @@ def _load_sample_dataset(
         ds = raw.map(_map_instruct, remove_columns=raw.column_names)
         text_key = "text"
 
-    # Shuffle and take 1 % — floor at 200 so the probe is never too noisy on
+    # Shuffle and take 2 % — floor at 200 so the probe is never too noisy on
     # small datasets (e.g. 5 k examples → 50 samples was not enough signal).
     data = list(ds)
     random.seed(42)
     random.shuffle(data)
-    sample_count = max(200, int(len(data) * 0.02))
+    sample_count = min(len(data), max(200, int(len(data) * 0.02)))
     return Dataset.from_list(data[:sample_count]), text_key
 
 
@@ -379,9 +379,9 @@ def find_lr(
         print(f"[LR Finder] Safe batch size: {safe_batch}", flush=True)
 
         # ------------------------------------------------------------------ #
-        # Load 1 % dataset sample
+        # Load 2 % dataset sample
         # ------------------------------------------------------------------ #
-        print(f"[LR Finder] Loading 1 % of {dataset_path} …", flush=True)
+        print(f"[LR Finder] Loading 2 % of {dataset_path} …", flush=True)
         sample_ds, text_key = _load_sample_dataset(dataset_path, dataset_type_dict, train_type)
         print(f"[LR Finder] Sample size: {len(sample_ds)} examples", flush=True)
 
