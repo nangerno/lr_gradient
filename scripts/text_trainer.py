@@ -302,10 +302,10 @@ def delete_poor_checkpoints(train_runs: list[dict]):
 
 def get_log_scale(task_type: str):
     log_scale_map = {
-        TaskType.INSTRUCTTEXTTASK.value: 0.22,
-        TaskType.DPOTASK.value: 0.22,
-        TaskType.GRPOTASK.value: 0.25,
-        TaskType.CHATTASK.value: 0.22,
+        TaskType.INSTRUCTTEXTTASK.value: 0.25,
+        TaskType.DPOTASK.value: 0.25,
+        TaskType.GRPOTASK.value: 0.27,
+        TaskType.CHATTASK.value: 0.25,
     }
     return log_scale_map[task_type]
 
