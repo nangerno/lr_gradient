@@ -35,6 +35,23 @@ ERROR_GENERATION_CONFIG_MODELS = [
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
+
+
+def _scalar_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
     
 class NaNSafeCallback(TrainerCallback):
     """
@@ -189,13 +206,6 @@ class CustomEvalSaveCallback(TrainerCallback):
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True
-
-            # Check if current_loss > current min_loss --> do not save to save time and space
-            # 
-            # if my_state["train"]["current_loss"] > current_min_loss:
-            #     print(f"Current loss: {my_state['train']['current_loss']} is greater than the current min_loss: {current_min_loss}, do not save the checkpoint", flush=True)
-            #     control.should_save = False
-            # check if this is the last run and the current_loss is the lowest --> keep running the training
             current_is_the_best = False
             runs_losses = [run["current_loss"] for run in my_state.get("runs", [])]
             current_min_loss = min(runs_losses) if runs_losses else float("inf")
@@ -308,35 +318,56 @@ class CustomEvalSaveCallback(TrainerCallback):
 
 
 class InstructCustomEvalSaveCallback(CustomEvalSaveCallback):
+    """Instruct SFT and DPO: `eval_loss` from Trainer — lower is better."""
+
     def compute_loss(self, state: TrainerState, metrics):
-        eval_loss = metrics.get("eval_loss", None)
-        if eval_loss is not None:
-            # Negate eval_loss so on_evaluate picks the checkpoint with
-            # MINIMUM (-eval_loss) = MAXIMUM eval_loss = highest test loss = wins tournament.
-            return -eval_loss
-        return None
+        metrics = metrics or {}
+        ev = _scalar_float(metrics.get("eval_loss"))
+        return ev
 
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
     def compute_loss(self, state: TrainerState, metrics):
-        eval_reward = None
-        if state.log_history:
-            last_log_entry = state.log_history[-1]
-            eval_reward = last_log_entry.get("eval_reward", None)
-            print(f"GRPO checkpoint selection: eval_reward={eval_reward} from last_log_entry keys={list(last_log_entry.keys())}", flush=True)
-        else:
-            print(f"state.log_history is empty", flush=True)
-
+        metrics = metrics or {}
+        # Prefer evaluate() `metrics` — log_history[-1] is usually the last *training* log, not eval.
+        eval_reward = metrics.get("eval_reward")
         if eval_reward is None:
-            eval_reward = metrics.get("eval_reward", None)
-            print(f"Fallback to metrics eval_reward={eval_reward}", flush=True)
+            for key in (
+                "eval_rewards/mean",
+                "eval/reward",
+                "eval_reward_mean",
+            ):
+                if key in metrics:
+                    eval_reward = metrics[key]
+                    break
 
-        # Return eval_reward directly (it is negative).
-        # on_evaluate selects the checkpoint when compute_loss(new) < best stored value.
-        # Keeping eval_reward un-negated means we select the checkpoint with the
-        # MOST NEGATIVE eval_reward, which corresponds to the HIGHEST tournament
-        # test loss (test_loss ≈ -eval_reward on the validator's held-out set).
-        return eval_reward
+        if eval_reward is None and state.log_history:
+            for entry in reversed(state.log_history):
+                if entry.get("eval_reward") is not None:
+                    eval_reward = entry["eval_reward"]
+                    print(
+                        "GRPO checkpoint selection: eval_reward from log_history "
+                        f"step={entry.get('step', '?')} keys={list(entry.keys())}",
+                        flush=True,
+                    )
+                    break
+
+        rv = _scalar_float(eval_reward)
+        if rv is not None:
+            # Higher reward is better; on_evaluate minimizes the stored scalar.
+            print(
+                f"GRPO checkpoint selection: eval_reward={rv} "
+                f"(minimizing -reward for best checkpoint)",
+                flush=True,
+            )
+            return -rv
+
+        print(
+            "WARNING: GRPO checkpoint selection: no eval_reward in evaluate() metrics "
+            "or log_history; skipping best-checkpoint update for this eval.",
+            flush=True,
+        )
+        return None
 
 
 def check_remaining_time_less_than_minutes(end_time: str, minutes: int) -> bool: 
