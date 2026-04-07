@@ -24,7 +24,7 @@ def get_instruct_lr(
     *,
     seq_len: int = 1024,
     steps: int = 40,
-    lr_points: int = 30,
+    lr_points: int = 35,
     optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
@@ -52,7 +52,7 @@ def get_dpo_lr(
     *,
     seq_len: int = 512,
     steps: int = 40,
-    lr_points: int = 30,
+    lr_points: int = 35,
     optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
@@ -84,7 +84,7 @@ def get_grpo_lr(
     max_prompt_length: int = 512,
     max_completion_length: int = 512,
     steps: int = 40,
-    lr_points: int = 30,
+    lr_points: int = 35,
     optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
