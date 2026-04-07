@@ -302,10 +302,10 @@ def delete_poor_checkpoints(train_runs: list[dict]):
 
 def get_log_scale(task_type: str):
     log_scale_map = {
-        TaskType.INSTRUCTTEXTTASK.value: 0.25,
-        TaskType.DPOTASK.value: 0.25,
-        TaskType.GRPOTASK.value: 0.27,
-        TaskType.CHATTASK.value: 0.25,
+        TaskType.INSTRUCTTEXTTASK.value: 0.15,
+        TaskType.DPOTASK.value: 0.15,
+        TaskType.GRPOTASK.value: 0.15,
+        TaskType.CHATTASK.value: 0.15,
     }
     return log_scale_map[task_type]
 
@@ -539,11 +539,7 @@ def main():
                 args.expected_repo_name,
             )
             time.sleep(5)
-
-            # ------------------------------------------------------------------ #
-            # Task-level fallback: if all inner retries failed, try progressively
-            # degraded configurations before giving up on this task entirely.
-            # ------------------------------------------------------------------ #
+            
             if not success:
                 print(
                     f"All inner retries failed for task {args.task_id} "
