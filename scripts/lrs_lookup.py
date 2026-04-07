@@ -21,6 +21,11 @@ def get_instruct_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
+    *,
+    seq_len: int = 1024,
+    steps: int = 40,
+    lr_points: int = 30,
+    optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -30,8 +35,10 @@ def get_instruct_lr(
         train_type="instruct",
         min_lr=1e-6,
         max_lr=9e-3,
-        steps=40,
-        seq_len=1024,
+        seq_len=seq_len,
+        steps=steps,
+        lr_points=lr_points,
+        optimizer_name=optimizer_name,
         lora_threshold=None,
     )
 
@@ -42,6 +49,11 @@ def get_dpo_lr(
     num_params: Optional[int],
     dataset_path: str,
     dataset_type_dict: dict,
+    *,
+    seq_len: int = 512,
+    steps: int = 40,
+    lr_points: int = 30,
+    optimizer_name: Optional[str] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -51,7 +63,10 @@ def get_dpo_lr(
         train_type="dpo",
         min_lr=1e-7,
         max_lr=9e-4,
-        seq_len=512,
+        seq_len=seq_len,
+        steps=steps,
+        lr_points=lr_points,
+        optimizer_name=optimizer_name,
         lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,

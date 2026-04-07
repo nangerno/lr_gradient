@@ -9,6 +9,10 @@ from model_utility import (
 from copy import deepcopy
 from lrs_lookup import get_dpo_lr
 
+_DPO_LR_FINDER_SCALE = 0.32
+_DPO_LR_CAP_MULT = 1.75
+_DPO_LR_FLOOR_MULT = 0.30
+
 
 def _bs_from_param_nums(param_nums) -> int:
     if param_nums is None:
@@ -71,6 +75,9 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "gradient_accumulation_steps",
         "output_dir",
         "request_path",
+        "warmup_steps",
+        "beta",
+        "max_grad_norm",
     ]
     for key in required_keys:
         if key not in config:
@@ -100,7 +107,9 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --logging_steps 5 \
     --learning_rate {learning_rate} \
     --weight_decay 0. \
-    --warmup_steps 35 \
+    --warmup_steps {warmup_steps} \
+    --max_grad_norm {max_grad_norm} \
+    --beta {beta} \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
     --tf32 True \
@@ -153,21 +162,48 @@ def get_training_json(train_info: dict) -> dict:
             if train_info.get("is_openai", False)
             else ""
         ),
+        "lr_finder_steps": 40,
+        "lr_finder_points": 30,
+        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 512)),
+        "warmup_steps": int(train_info.get("dpo_warmup_steps", 180)),
+        "beta": float(train_info.get("dpo_beta", 0.08)),
+        "max_grad_norm": float(train_info.get("dpo_max_grad_norm", 0.35)),
     }
 
     if train_info["find_lk_lr"]:
         dataset_path = train_info.get("dataset", "")
         dataset_type_dict = train_info.get("dataset_type", {})
 
-        lr_result = get_dpo_lr(model_name, model_path, param_nums, dataset_path, dataset_type_dict)
+        lr_result = get_dpo_lr(
+            model_name,
+            model_path,
+            param_nums,
+            dataset_path,
+            dataset_type_dict,
+            seq_len=run_config["lr_finder_seq_len"],
+            steps=run_config["lr_finder_steps"],
+            lr_points=run_config["lr_finder_points"],
+            optimizer_name=run_config["optimizer"],
+        )
 
         if lr_result is not None:
             lr = lr_result.get("lr")
             bs = lr_result.get("batch_size")
 
             if lr is not None:
-                print(f"Using lr from dynamic finder: {lr}", flush=True)
-                run_config["learning_rate"] = lr
+                fallback_lr = _lr_from_param_nums(param_nums)
+                scaled = lr * _DPO_LR_FINDER_SCALE
+                cap = fallback_lr * _DPO_LR_CAP_MULT
+                floor = fallback_lr * _DPO_LR_FLOOR_MULT
+                applied = max(floor, min(scaled, cap))
+                run_config["learning_rate"] = applied
+                print(
+                    f"Using lr from dynamic finder: raw={lr}, "
+                    f"DPO-scaled×{_DPO_LR_FINDER_SCALE}={scaled}, "
+                    f"band=[{floor},{cap}], applied={applied} "
+                    f"(fallback heuristic={fallback_lr})",
+                    flush=True,
+                )
             else:
                 fallback_lr = _lr_from_param_nums(param_nums)
                 print(f"LR finder returned no lr, using param-based fallback: {fallback_lr}", flush=True)

@@ -145,6 +145,10 @@ def get_training_json(train_info: dict) -> dict:
             if train_info.get("is_openai", False)
             else ""
         ),
+        "lr_finder_steps": 40,
+        "lr_finder_points": 30,
+        # Match typical instruct max_length in tokenize_instruct / training (override via train_info if set).
+        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
     }
 
     if train_info["find_lk_lr"]:
@@ -157,6 +161,10 @@ def get_training_json(train_info: dict) -> dict:
             param_nums,
             dataset_path,
             dataset_type_dict,
+            seq_len=run_config["lr_finder_seq_len"],
+            steps=run_config["lr_finder_steps"],
+            lr_points=run_config["lr_finder_points"],
+            optimizer_name=run_config["optimizer"],
         )
 
         if lr_result is not None:
