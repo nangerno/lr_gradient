@@ -1,7 +1,7 @@
 import json
 import math
 import random
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import torch
@@ -121,6 +121,66 @@ def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
     return [math.exp(log_min + i * step) for i in range(points)]
 
 
+def _moving_average_np(x: np.ndarray, window: int) -> np.ndarray:
+    """Moving average with `mode=same` length; no-op when `window <= 1`."""
+    x = np.asarray(x, dtype=np.float64)
+    if window <= 1 or len(x) < 2:
+        return x
+    w = min(window, len(x))
+    kernel = np.ones(w, dtype=np.float64) / float(w)
+    return np.convolve(x, kernel, mode="same")
+
+
+def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
+    """
+    Leslie Smith / fastai-style: LR at the segment where smoothed loss decreases
+    fastest per unit log(LR) (minimum d(loss)/d(log lr)); falls back safely if flat.
+    """
+    lr_arr = np.array(lrs, dtype=np.float64)
+    loss_arr = np.array(losses, dtype=np.float64)
+    finite = np.isfinite(loss_arr) & np.isfinite(lr_arr) & (lr_arr > 0)
+    if not finite.any():
+        return float(lr_arr[0]) if len(lr_arr) else 1e-6
+
+    lr_f = lr_arr[finite]
+    loss_f = loss_arr[finite]
+    if len(lr_f) < 3:
+        j = int(np.nanargmin(loss_f))
+        return float(lr_f[j])
+
+    smooth = _moving_average_np(loss_f, window=min(5, len(loss_f)))
+    if len(smooth) < 2:
+        return float(lr_f[0])
+
+    log_lr = np.log(lr_f)
+    dlog = np.diff(log_lr)
+    dloss = np.diff(smooth)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        slope = np.where(dlog != 0, dloss / dlog, np.nan)
+
+    valid = np.isfinite(slope)
+    if not valid.any():
+        return float(lr_f[0])
+
+    masked = np.where(valid, slope, np.nan)
+    if np.nanmin(masked) >= 0:
+        print(
+            "  [LR Finder] Smith curve: loss never decreases along ramp; "
+            f"using min LR {lr_f[0]:.2e}",
+            flush=True,
+        )
+        return float(lr_f[0])
+
+    # Steepest descent: most negative slope (loss drops fastest as LR increases).
+    j = int(np.nanargmin(masked))
+    chosen = float(lr_f[j])
+    print(
+        f"  [LR Finder] Smith curve: steepest descent segment ends near LR {chosen:.2e}",
+        flush=True,
+    )
+    return chosen
+
+
 # --------------------------------------------------------------------------- #
 # Micro-training kernels
 # --------------------------------------------------------------------------- #
@@ -206,6 +266,131 @@ def _micro_train(
     return float(np.mean(losses)) if losses else float("inf")
 
 
+def _iter_batches_forever(dataloader):
+    while True:
+        for batch in dataloader:
+            yield batch
+
+
+def _micro_train_leslie_smith(
+    model,
+    tokenizer,
+    dataloader,
+    lr_schedule: list[float],
+    text_key: str,
+    device: str,
+    seq_len: int,
+    optimizer_name: Optional[str],
+) -> tuple[list[float], list[float]]:
+    """
+    Single continuous run with exponentially increasing LR each step (Leslie Smith).
+    """
+    if not lr_schedule:
+        return [], []
+
+    optimizer = _make_optimizer(model, lr_schedule[0], optimizer_name)
+    trainable = _trainable_params(model)
+    model.train()
+    lrs_recorded: list[float] = []
+    losses_recorded: list[float] = []
+    batch_iter = _iter_batches_forever(dataloader)
+
+    for step in range(len(lr_schedule)):
+        lr = lr_schedule[step]
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+        batch = next(batch_iter)
+        optimizer.zero_grad()
+
+        texts = batch[text_key]
+        inputs = tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=seq_len,
+        ).to(device)
+
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            outputs = model(**inputs, labels=inputs["input_ids"])
+            loss = outputs.loss
+
+        if not torch.isfinite(loss):
+            lrs_recorded.append(lr)
+            losses_recorded.append(float("nan"))
+            print(
+                "  [LR Finder] Smith ramp: non-finite loss; stopping curve early.",
+                flush=True,
+            )
+            break
+
+        lrs_recorded.append(lr)
+        losses_recorded.append(loss.item())
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+        optimizer.step()
+
+    return lrs_recorded, losses_recorded
+
+
+def _run_smith_with_auto_batch(
+    model,
+    tokenizer,
+    dataset: Dataset,
+    safe_batch: int,
+    lr_schedule: list[float],
+    text_key: str,
+    train_type: str,
+    device: str,
+    seq_len: int = 512,
+    optimizer_name: Optional[str] = None,
+) -> tuple[float, int]:
+    trainable_snapshot = {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+    def _restore_trainable_weights() -> None:
+        for name, param in model.named_parameters():
+            if name in trainable_snapshot:
+                param.data.copy_(trainable_snapshot[name])
+        model.zero_grad(set_to_none=True)
+
+    start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
+    batch_size = start_batch
+
+    while batch_size >= 1:
+        try:
+            _restore_trainable_weights()
+            dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            lrs_out, losses_out = _micro_train_leslie_smith(
+                model,
+                tokenizer,
+                dl,
+                lr_schedule,
+                text_key,
+                device,
+                seq_len=seq_len,
+                optimizer_name=optimizer_name,
+            )
+            best_lr = _pick_lr_from_smith_curve(lrs_out, losses_out)
+            return best_lr, batch_size
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(
+                    f"  [LR Finder] OOM at batch_size={batch_size}, halving …",
+                    flush=True,
+                )
+                batch_size //= 2
+                torch.cuda.empty_cache()
+            else:
+                raise
+
+    raise RuntimeError("Even batch_size=1 does not fit in GPU memory.")
+
+
 def _pick_best_lr(
     model,
     tokenizer,
@@ -275,12 +460,25 @@ def _run_with_auto_batch(
     seq_len: int = 512,
     optimizer_name: Optional[str] = None,
 ) -> tuple[float, int]:
+    trainable_snapshot = {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+    def _restore_trainable_weights() -> None:
+        for name, param in model.named_parameters():
+            if name in trainable_snapshot:
+                param.data.copy_(trainable_snapshot[name])
+        model.zero_grad(set_to_none=True)
+
     # DPO processes two sequences per sample, so start smaller.
     start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
     batch_size = start_batch
 
     while batch_size >= 1:
         try:
+            _restore_trainable_weights()
             # shuffle=False: _load_sample_dataset already shuffled; keeps batch order
             # identical across LR candidates so losses are comparable.
             dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -377,6 +575,7 @@ def find_lr(
     train_type: str = "instruct",
     min_lr: float = 6e-6,
     max_lr: float = 1e-3,
+    # Grid search only; Leslie Smith uses `steps` as the number of schedule points.
     lr_points: int = 30,
     steps: int = 20,
     seq_len: int = 512,
@@ -389,6 +588,8 @@ def find_lr(
     lora_dropout: float = _DEFAULT_LORA_DROPOUT,
     # e.g. "paged_adamw_8bit" to match GRPO/SFT training; None → AdamW on trainable only.
     optimizer_name: Optional[str] = None,
+    # Leslie Smith exponential ramp (single run) vs independent grid micro-runs.
+    search_mode: Literal["leslie_smith", "grid"] = "leslie_smith",
 ) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
@@ -402,7 +603,8 @@ def find_lr(
         f"[LR Finder] model={model_id}  type={train_type}  "
         f"params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
-        + f"  optim={_opt_disp}  micro_steps={steps}  lr_points={lr_points}",
+        + f"  optim={_opt_disp}  search={search_mode}  micro_steps={steps}"
+        + (f"  lr_points={lr_points}" if search_mode == "grid" else ""),
         flush=True,
     )
 
@@ -456,34 +658,53 @@ def find_lr(
         print(f"[LR Finder] Safe batch size: {safe_batch}", flush=True)
 
         # ------------------------------------------------------------------ #
-        # Load 1 % dataset sample
+        # Load ~2 % dataset sample (see _load_sample_dataset)
         # ------------------------------------------------------------------ #
         print(f"[LR Finder] Loading sample subset of {dataset_path} …", flush=True)
         sample_ds, text_key = _load_sample_dataset(dataset_path, dataset_type_dict, train_type)
         print(f"[LR Finder] Sample size: {len(sample_ds)} examples", flush=True)
 
         # ------------------------------------------------------------------ #
-        # Sweep LR candidates
+        # LR search: Leslie Smith ramp or discrete grid
         # ------------------------------------------------------------------ #
-        lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)
-        print(
-            f"[LR Finder] Sweeping {lr_points} LRs: {min_lr:.2e} → {max_lr:.2e}",
-            flush=True,
-        )
-
-        best_lr, probe_batch = _run_with_auto_batch(
-            model,
-            tokenizer,
-            sample_ds,
-            safe_batch,
-            lr_candidates,
-            text_key,
-            train_type,
-            steps,
-            device,
-            seq_len=seq_len,
-            optimizer_name=optimizer_name,
-        )
+        if search_mode == "leslie_smith":
+            lr_schedule = get_lr_candidates(min_lr, max_lr, steps)
+            print(
+                f"[LR Finder] Leslie Smith LR ramp: {steps} steps  "
+                f"{min_lr:.2e} → {max_lr:.2e}",
+                flush=True,
+            )
+            best_lr, probe_batch = _run_smith_with_auto_batch(
+                model,
+                tokenizer,
+                sample_ds,
+                safe_batch,
+                lr_schedule,
+                text_key,
+                train_type,
+                device,
+                seq_len=seq_len,
+                optimizer_name=optimizer_name,
+            )
+        else:
+            lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)
+            print(
+                f"[LR Finder] Grid sweep: {lr_points} LRs: {min_lr:.2e} → {max_lr:.2e}",
+                flush=True,
+            )
+            best_lr, probe_batch = _run_with_auto_batch(
+                model,
+                tokenizer,
+                sample_ds,
+                safe_batch,
+                lr_candidates,
+                text_key,
+                train_type,
+                steps,
+                device,
+                seq_len=seq_len,
+                optimizer_name=optimizer_name,
+            )
 
         print(
             f"[LR Finder] Selected LR: {best_lr:.2e}  "
