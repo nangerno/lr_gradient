@@ -1,3 +1,4 @@
+import contextlib
 import json
 import math
 import random
@@ -69,6 +70,13 @@ def _find_all_linear_names(model) -> list[str]:
     return list(names)
 
 
+def _bf16_autocast(device: str):
+    """bf16 autocast on CUDA; no-op on CPU (avoids deprecated torch.cuda.amp.autocast)."""
+    if device == "cuda" and torch.cuda.is_available():
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 # --------------------------------------------------------------------------- #
 # Auto batch-size finder
 # --------------------------------------------------------------------------- #
@@ -76,7 +84,7 @@ def _find_all_linear_names(model) -> list[str]:
 def _can_run(model, tokenizer, batch_size: int, seq_len: int, device: str) -> bool:
     try:
         ids = torch.randint(0, tokenizer.vocab_size, (batch_size, seq_len)).to(device)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with _bf16_autocast(device):
             out = model(ids, labels=ids)
         out.loss.backward()
         model.zero_grad()
@@ -261,7 +269,7 @@ def _micro_train(
             max_length=seq_len,
         ).to(device)
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with _bf16_autocast(device):
             outputs = model(**inputs, labels=inputs["input_ids"])
             loss = outputs.loss
 
@@ -326,7 +334,7 @@ def _micro_train_leslie_smith(
             max_length=seq_len,
         ).to(device)
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with _bf16_autocast(device):
             outputs = model(**inputs, labels=inputs["input_ids"])
             loss = outputs.loss
 
