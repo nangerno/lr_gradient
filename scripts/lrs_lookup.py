@@ -1,5 +1,5 @@
 from typing import Optional
-from lr_finder import find_lr  # returns Optional[dict] with keys "lr" and "batch_size"; default search_mode=leslie_smith ignores lr_points (uses steps)
+from lr_finder import find_lr
 
 _DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
 _DPO_GRPO_LORA_R         = 128

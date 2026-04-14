@@ -113,6 +113,10 @@ def find_max_batch_size(model, tokenizer, seq_len: int = 512, device: str = "cud
 # --------------------------------------------------------------------------- #
 
 def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
+    if min_lr <= 0 or max_lr <= 0:
+        raise ValueError("get_lr_candidates requires positive min_lr and max_lr.")
+    if min_lr > max_lr:
+        min_lr, max_lr = max_lr, min_lr
     if points <= 1:
         return [min_lr]
     log_min = math.log(min_lr)
@@ -133,8 +137,10 @@ def _moving_average_np(x: np.ndarray, window: int) -> np.ndarray:
 
 def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
     """
-    Leslie Smith / fastai-style: LR at the segment where smoothed loss decreases
-    fastest per unit log(LR) (minimum d(loss)/d(log lr)); falls back safely if flat.
+    Leslie Smith / fastai-style: LR at the start of the segment where smoothed loss
+    decreases fastest per unit log(LR) (minimum d(loss)/d(log lr)), matching fastai's
+    ``steep()`` on discrete samples. Optionally trims unstable ends like fastai's
+    ``lr_find`` (first ~10% and last 5 points) when enough data remain.
     """
     lr_arr = np.array(lrs, dtype=np.float64)
     loss_arr = np.array(losses, dtype=np.float64)
@@ -144,6 +150,13 @@ def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
 
     lr_f = lr_arr[finite]
     loss_f = loss_arr[finite]
+    # Match fastai Learner.lr_find: drop noisy start and divergent tail before suggesting.
+    _trim_lo = len(lr_f) // 10
+    _trim_hi = 5
+    if len(lr_f) > _trim_lo + _trim_hi + 4:
+        lr_f = lr_f[_trim_lo : len(lr_f) - _trim_hi]
+        loss_f = loss_f[_trim_lo : len(loss_f) - _trim_hi]
+
     if len(lr_f) < 3:
         j = int(np.nanargmin(loss_f))
         return float(lr_f[j])
@@ -172,10 +185,11 @@ def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
         return float(lr_f[0])
 
     # Steepest descent: most negative slope (loss drops fastest as LR increases).
+    # Index j is the left edge of that segment (same convention as fastai ``steep``).
     j = int(np.nanargmin(masked))
     chosen = float(lr_f[j])
     print(
-        f"  [LR Finder] Smith curve: steepest descent segment ends near LR {chosen:.2e}",
+        f"  [LR Finder] Smith curve: steepest descent (d loss / d log lr) near LR {chosen:.2e}",
         flush=True,
     )
     return chosen
@@ -341,7 +355,6 @@ def _run_smith_with_auto_batch(
     safe_batch: int,
     lr_schedule: list[float],
     text_key: str,
-    train_type: str,
     device: str,
     seq_len: int = 512,
     optimizer_name: Optional[str] = None,
@@ -358,7 +371,8 @@ def _run_smith_with_auto_batch(
                 param.data.copy_(trainable_snapshot[name])
         model.zero_grad(set_to_none=True)
 
-    start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
+    # One causal-LM forward per row (DPO uses ``chosen`` only; not full DPO pairwise loss).
+    start_batch = max(1, safe_batch // 2)
     batch_size = start_batch
 
     while batch_size >= 1:
@@ -454,7 +468,6 @@ def _run_with_auto_batch(
     safe_batch: int,
     lr_candidates: list[float],
     text_key: str,
-    train_type: str,
     steps: int,
     device: str,
     seq_len: int = 512,
@@ -472,8 +485,8 @@ def _run_with_auto_batch(
                 param.data.copy_(trainable_snapshot[name])
         model.zero_grad(set_to_none=True)
 
-    # DPO processes two sequences per sample, so start smaller.
-    start_batch = max(1, safe_batch // 4 if train_type == "dpo" else safe_batch // 2)
+    # Same as Leslie Smith ramp: one forward per row (DPO: ``chosen`` only).
+    start_batch = max(1, safe_batch // 2)
     batch_size = start_batch
 
     while batch_size >= 1:
@@ -520,6 +533,12 @@ def _load_sample_dataset(
     """
     Load the raw JSON dataset, extract the relevant text column, then return
     a shuffled subset (~2 %, min 200 rows) together with the text column name.
+
+    Task columns (all use standard CE loss in the probe, not full DPO/GRPO train loss):
+
+    - ``instruct``: concatenated instruction/input/output → ``text``.
+    - ``dpo``: ``chosen`` only (preference ``rejected`` is ignored in the probe).
+    - ``grpo``: ``prompt`` (or fallback text) → ``text`` (no generations in probe).
     """
     raw = load_dataset("json", data_files=dataset_path)["train"]
 
@@ -681,7 +700,6 @@ def find_lr(
                 safe_batch,
                 lr_schedule,
                 text_key,
-                train_type,
                 device,
                 seq_len=seq_len,
                 optimizer_name=optimizer_name,
@@ -699,7 +717,6 @@ def find_lr(
                 safe_batch,
                 lr_candidates,
                 text_key,
-                train_type,
                 steps,
                 device,
                 seq_len=seq_len,
