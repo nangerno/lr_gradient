@@ -143,18 +143,29 @@ def _moving_average_np(x: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(x, kernel, mode="same")
 
 
-def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
+def _pick_lr_from_smith_curve(
+    lrs: list[float],
+    losses: list[float],
+    *,
+    min_lr: float,
+    max_lr: float,
+    smith_safety_divisor: float,
+) -> float:
     """
-    Leslie Smith / fastai-style: LR at the start of the segment where smoothed loss
-    decreases fastest per unit log(LR) (minimum d(loss)/d(log lr)), matching fastai's
-    ``steep()`` on discrete samples. Optionally trims unstable ends like fastai's
-    ``lr_find`` (first ~10% and last 5 points) when enough data remain.
+    Leslie Smith ramp: locate the steepest-loss-drop segment (like fastai ``steep``),
+    then **scale down** for training — the steepest point often sits just before
+    instability, especially for full finetune + small batch. Final LR is
+    ``steepest_lr / smith_safety_divisor``, clamped to ``[min_lr, max_lr]``.
     """
+
+    def _clamp(r: float) -> float:
+        return float(max(min_lr, min(r, max_lr)))
+
     lr_arr = np.array(lrs, dtype=np.float64)
     loss_arr = np.array(losses, dtype=np.float64)
     finite = np.isfinite(loss_arr) & np.isfinite(lr_arr) & (lr_arr > 0)
     if not finite.any():
-        return float(lr_arr[0]) if len(lr_arr) else 1e-6
+        return _clamp(float(lr_arr[0]) if len(lr_arr) else 1e-6)
 
     lr_f = lr_arr[finite]
     loss_f = loss_arr[finite]
@@ -167,11 +178,18 @@ def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
 
     if len(lr_f) < 3:
         j = int(np.nanargmin(loss_f))
-        return float(lr_f[j])
+        raw = float(lr_f[j])
+        out = _clamp(raw / smith_safety_divisor)
+        print(
+            f"  [LR Finder] Smith curve: short ramp — min-loss anchor {raw:.2e} → "
+            f"LR {out:.2e} (÷{smith_safety_divisor:g})",
+            flush=True,
+        )
+        return out
 
     smooth = _moving_average_np(loss_f, window=min(5, len(loss_f)))
     if len(smooth) < 2:
-        return float(lr_f[0])
+        return _clamp(float(lr_f[0]))
 
     log_lr = np.log(lr_f)
     dlog = np.diff(log_lr)
@@ -181,7 +199,7 @@ def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
 
     valid = np.isfinite(slope)
     if not valid.any():
-        return float(lr_f[0])
+        return _clamp(float(lr_f[0]))
 
     masked = np.where(valid, slope, np.nan)
     if np.nanmin(masked) >= 0:
@@ -190,17 +208,19 @@ def _pick_lr_from_smith_curve(lrs: list[float], losses: list[float]) -> float:
             f"using min LR {lr_f[0]:.2e}",
             flush=True,
         )
-        return float(lr_f[0])
+        return _clamp(float(lr_f[0]))
 
     # Steepest descent: most negative slope (loss drops fastest as LR increases).
     # Index j is the left edge of that segment (same convention as fastai ``steep``).
     j = int(np.nanargmin(masked))
-    chosen = float(lr_f[j])
+    raw_steep = float(lr_f[j])
+    out = _clamp(raw_steep / smith_safety_divisor)
     print(
-        f"  [LR Finder] Smith curve: steepest descent (d loss / d log lr) near LR {chosen:.2e}",
+        f"  [LR Finder] Smith curve: steepest ~{raw_steep:.2e} → training LR {out:.2e} "
+        f"(÷{smith_safety_divisor:g})",
         flush=True,
     )
-    return chosen
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +386,10 @@ def _run_smith_with_auto_batch(
     device: str,
     seq_len: int = 512,
     optimizer_name: Optional[str] = None,
+    *,
+    min_lr: float,
+    max_lr: float,
+    smith_safety_divisor: float,
 ) -> tuple[float, int]:
     trainable_snapshot = {
         name: param.detach().clone()
@@ -397,7 +421,13 @@ def _run_smith_with_auto_batch(
                 seq_len=seq_len,
                 optimizer_name=optimizer_name,
             )
-            best_lr = _pick_lr_from_smith_curve(lrs_out, losses_out)
+            best_lr = _pick_lr_from_smith_curve(
+                lrs_out,
+                losses_out,
+                min_lr=min_lr,
+                max_lr=max_lr,
+                smith_safety_divisor=smith_safety_divisor,
+            )
             return best_lr, batch_size
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
@@ -617,12 +647,22 @@ def find_lr(
     optimizer_name: Optional[str] = None,
     # Leslie Smith exponential ramp (single run) vs independent grid micro-runs.
     search_mode: Literal["leslie_smith", "grid"] = "leslie_smith",
+    # Divide raw steepest-descent LR by this (then clamp to [min_lr, max_lr]).
+    # None → 10 for full finetune, 5 for LoRA (steepest point is often ~10× too high to train).
+    smith_safety_divisor: Optional[float] = None,
 ) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
         and num_params is not None
         and num_params >= lora_threshold
     )
+    eff_smith_div = (
+        smith_safety_divisor
+        if smith_safety_divisor is not None
+        else (5.0 if use_lora else 10.0)
+    )
+    if eff_smith_div <= 0:
+        raise ValueError("smith_safety_divisor must be positive.")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     _opt_disp = optimizer_name or "adamw_torch"
@@ -631,7 +671,12 @@ def find_lr(
         f"params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
         + f"  optim={_opt_disp}  search={search_mode}  micro_steps={steps}"
-        + (f"  lr_points={lr_points}" if search_mode == "grid" else ""),
+        + (f"  lr_points={lr_points}" if search_mode == "grid" else "")
+        + (
+            f"  smith_safety_divisor={eff_smith_div:g}"
+            if search_mode == "leslie_smith"
+            else ""
+        ),
         flush=True,
     )
 
@@ -711,6 +756,9 @@ def find_lr(
                 device,
                 seq_len=seq_len,
                 optimizer_name=optimizer_name,
+                min_lr=min_lr,
+                max_lr=max_lr,
+                smith_safety_divisor=eff_smith_div,
             )
         else:
             lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)

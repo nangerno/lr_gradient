@@ -26,6 +26,7 @@ def get_instruct_lr(
     steps: int = 40,
     lr_points: int = 35,
     optimizer_name: Optional[str] = None,
+    smith_safety_divisor: Optional[float] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -40,6 +41,7 @@ def get_instruct_lr(
         lr_points=lr_points,
         optimizer_name=optimizer_name,
         lora_threshold=None,
+        smith_safety_divisor=smith_safety_divisor,
     )
 
 
@@ -54,6 +56,7 @@ def get_dpo_lr(
     steps: int = 40,
     lr_points: int = 35,
     optimizer_name: Optional[str] = None,
+    smith_safety_divisor: Optional[float] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -71,6 +74,7 @@ def get_dpo_lr(
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
         lora_dropout=_DPO_GRPO_LORA_DROPOUT,
+        smith_safety_divisor=smith_safety_divisor,
     )
 
 
@@ -86,6 +90,7 @@ def get_grpo_lr(
     steps: int = 40,
     lr_points: int = 35,
     optimizer_name: Optional[str] = None,
+    smith_safety_divisor: Optional[float] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -109,6 +114,7 @@ def get_grpo_lr(
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
         lora_dropout=_DPO_GRPO_LORA_DROPOUT,
+        smith_safety_divisor=smith_safety_divisor,
     )
 
 
@@ -124,6 +130,7 @@ def get_grpo_python_lr(
     steps: int = 40,
     lr_points: int = 30,
     optimizer_name: Optional[str] = None,
+    smith_safety_divisor: Optional[float] = None,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -147,4 +154,5 @@ def get_grpo_python_lr(
         lora_r=_DPO_GRPO_LORA_R,
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
         lora_dropout=_DPO_GRPO_LORA_DROPOUT,
+        smith_safety_divisor=smith_safety_divisor,
     )
