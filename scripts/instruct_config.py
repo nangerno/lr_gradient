@@ -6,7 +6,7 @@ from model_utility import (
     get_gpu_count,
 )
 from copy import deepcopy
-from lrs_lookup import get_instruct_lr
+from lrs_lookup import get_instruct_lr, is_dataset_available_for_lr_finder
 
 
 def get_run_cmd(config: dict, gpu_nums: int):
@@ -145,16 +145,33 @@ def get_training_json(train_info: dict) -> dict:
             if train_info.get("is_openai", False)
             else ""
         ),
-        "lr_finder_steps": 40,
-        "lr_finder_points": 30,
+        # Fewer Smith points = faster probe; override with train_info["lr_finder_steps"].
+        "lr_finder_steps": int(train_info.get("lr_finder_steps", 28)),
+        "lr_finder_points": int(train_info.get("lr_finder_points", 30)),
         # Match typical instruct max_length in tokenize_instruct / training (override via train_info if set).
         "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
+        "lr_finder_smith_micro_batches": int(train_info.get("lr_finder_smith_micro_batches", 1)),
+        "lr_finder_smith_early_stop": bool(train_info.get("lr_finder_smith_early_stop", True)),
+        "lr_finder_smith_divergence_mult": float(
+            train_info.get("lr_finder_smith_divergence_mult", 10.0)
+        ),
+        "lr_finder_smith_min_points": int(train_info.get("lr_finder_smith_min_points", 5)),
+        "lr_finder_sample_frac": float(train_info.get("lr_finder_sample_frac", 0.02)),
+        "lr_finder_sample_min": int(train_info.get("lr_finder_sample_min", 200)),
+        "lr_finder_sample_max": int(train_info.get("lr_finder_sample_max", 3000)),
+        "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
+        "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
     }
 
-    if train_info["find_lk_lr"]:
-        dataset_path = train_info.get("dataset", "")
-        dataset_type_dict = train_info.get("dataset_type", {})
+    dataset_path = train_info.get("dataset", "")
+    dataset_type_dict = train_info.get("dataset_type", {})
 
+    if not is_dataset_available_for_lr_finder(dataset_path):
+        print(
+            "[LR Finder] Skipping: no dataset path; using param-based learning rate.",
+            flush=True,
+        )
+    else:
         lr_result = get_instruct_lr(
             model_name,
             model_path,
@@ -165,6 +182,15 @@ def get_training_json(train_info: dict) -> dict:
             steps=run_config["lr_finder_steps"],
             lr_points=run_config["lr_finder_points"],
             optimizer_name=run_config["optimizer"],
+            smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
+            smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
+            smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
+            smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
+            lr_sample_frac=run_config["lr_finder_sample_frac"],
+            lr_sample_min=run_config["lr_finder_sample_min"],
+            lr_sample_max=run_config["lr_finder_sample_max"],
+            lr_sample_stratify=run_config["lr_finder_stratify_length"],
+            lr_sample_seed=run_config["lr_finder_sample_seed"],
         )
 
         if lr_result is not None:
@@ -183,7 +209,11 @@ def get_training_json(train_info: dict) -> dict:
                 print(f"Using batch size from dynamic finder: {bs}", flush=True)
                 run_config["batch_size"] = bs
         else:
-            print(f"LR finder failed, using param-based fallback: {run_config['learning_rate']}", flush=True)
+            print(
+                "[LR Finder] Probe failed or errored; using param-based learning rate: "
+                f"{run_config['learning_rate']}",
+                flush=True,
+            )
 
     # Keep scheduling math safe even when GPU auto-detection fails.
     effective_gpu_nums = max(1, run_config["gpu_nums"])
@@ -199,6 +229,7 @@ def get_training_json(train_info: dict) -> dict:
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
 
     train_request = deepcopy(train_info)
+    train_request["find_lk_lr"] = True
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 250

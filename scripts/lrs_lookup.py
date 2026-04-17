@@ -2,7 +2,14 @@ from typing import Optional
 from lr_finder import find_lr
 
 _DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
-_DPO_GRPO_LORA_R         = 128
+
+
+def is_dataset_available_for_lr_finder(dataset_path: Optional[str]) -> bool:
+    """Empty/missing path skips LR finder (not an error). Callers print a distinct message."""
+    return bool(dataset_path and str(dataset_path).strip())
+
+
+_DPO_GRPO_LORA_R = 128
 _DPO_GRPO_LORA_ALPHA     = 256
 _DPO_GRPO_LORA_DROPOUT   = 0.05
 
@@ -27,6 +34,15 @@ def get_instruct_lr(
     lr_points: int = 35,
     optimizer_name: Optional[str] = None,
     smith_safety_divisor: Optional[float] = None,
+    smith_micro_batches: int = 1,
+    smith_early_stop_divergence: bool = True,
+    smith_divergence_vs_min: float = 10.0,
+    smith_min_points_before_divergence: int = 5,
+    lr_sample_frac: float = 0.02,
+    lr_sample_min: int = 200,
+    lr_sample_max: int = 3000,
+    lr_sample_stratify: bool = True,
+    lr_sample_seed: int = 42,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -42,6 +58,15 @@ def get_instruct_lr(
         optimizer_name=optimizer_name,
         lora_threshold=None,
         smith_safety_divisor=smith_safety_divisor,
+        smith_micro_batches=smith_micro_batches,
+        smith_early_stop_divergence=smith_early_stop_divergence,
+        smith_divergence_vs_min=smith_divergence_vs_min,
+        smith_min_points_before_divergence=smith_min_points_before_divergence,
+        lr_sample_frac=lr_sample_frac,
+        lr_sample_min=lr_sample_min,
+        lr_sample_max=lr_sample_max,
+        lr_sample_stratify=lr_sample_stratify,
+        lr_sample_seed=lr_sample_seed,
     )
 
 
@@ -57,6 +82,15 @@ def get_dpo_lr(
     lr_points: int = 35,
     optimizer_name: Optional[str] = None,
     smith_safety_divisor: Optional[float] = None,
+    smith_micro_batches: int = 1,
+    smith_early_stop_divergence: bool = True,
+    smith_divergence_vs_min: float = 10.0,
+    smith_min_points_before_divergence: int = 5,
+    lr_sample_frac: float = 0.02,
+    lr_sample_min: int = 200,
+    lr_sample_max: int = 3000,
+    lr_sample_stratify: bool = True,
+    lr_sample_seed: int = 42,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -75,6 +109,15 @@ def get_dpo_lr(
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
         lora_dropout=_DPO_GRPO_LORA_DROPOUT,
         smith_safety_divisor=smith_safety_divisor,
+        smith_micro_batches=smith_micro_batches,
+        smith_early_stop_divergence=smith_early_stop_divergence,
+        smith_divergence_vs_min=smith_divergence_vs_min,
+        smith_min_points_before_divergence=smith_min_points_before_divergence,
+        lr_sample_frac=lr_sample_frac,
+        lr_sample_min=lr_sample_min,
+        lr_sample_max=lr_sample_max,
+        lr_sample_stratify=lr_sample_stratify,
+        lr_sample_seed=lr_sample_seed,
     )
 
 
@@ -91,6 +134,15 @@ def get_grpo_lr(
     lr_points: int = 35,
     optimizer_name: Optional[str] = None,
     smith_safety_divisor: Optional[float] = None,
+    smith_micro_batches: int = 1,
+    smith_early_stop_divergence: bool = True,
+    smith_divergence_vs_min: float = 10.0,
+    smith_min_points_before_divergence: int = 5,
+    lr_sample_frac: float = 0.02,
+    lr_sample_min: int = 200,
+    lr_sample_max: int = 3000,
+    lr_sample_stratify: bool = True,
+    lr_sample_seed: int = 42,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -115,6 +167,15 @@ def get_grpo_lr(
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
         lora_dropout=_DPO_GRPO_LORA_DROPOUT,
         smith_safety_divisor=smith_safety_divisor,
+        smith_micro_batches=smith_micro_batches,
+        smith_early_stop_divergence=smith_early_stop_divergence,
+        smith_divergence_vs_min=smith_divergence_vs_min,
+        smith_min_points_before_divergence=smith_min_points_before_divergence,
+        lr_sample_frac=lr_sample_frac,
+        lr_sample_min=lr_sample_min,
+        lr_sample_max=lr_sample_max,
+        lr_sample_stratify=lr_sample_stratify,
+        lr_sample_seed=lr_sample_seed,
     )
 
 
@@ -131,6 +192,15 @@ def get_grpo_python_lr(
     lr_points: int = 30,
     optimizer_name: Optional[str] = None,
     smith_safety_divisor: Optional[float] = None,
+    smith_micro_batches: int = 1,
+    smith_early_stop_divergence: bool = True,
+    smith_divergence_vs_min: float = 10.0,
+    smith_min_points_before_divergence: int = 5,
+    lr_sample_frac: float = 0.02,
+    lr_sample_min: int = 200,
+    lr_sample_max: int = 3000,
+    lr_sample_stratify: bool = True,
+    lr_sample_seed: int = 42,
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -155,4 +225,13 @@ def get_grpo_python_lr(
         lora_alpha=_DPO_GRPO_LORA_ALPHA,
         lora_dropout=_DPO_GRPO_LORA_DROPOUT,
         smith_safety_divisor=smith_safety_divisor,
+        smith_micro_batches=smith_micro_batches,
+        smith_early_stop_divergence=smith_early_stop_divergence,
+        smith_divergence_vs_min=smith_divergence_vs_min,
+        smith_min_points_before_divergence=smith_min_points_before_divergence,
+        lr_sample_frac=lr_sample_frac,
+        lr_sample_min=lr_sample_min,
+        lr_sample_max=lr_sample_max,
+        lr_sample_stratify=lr_sample_stratify,
+        lr_sample_seed=lr_sample_seed,
     )

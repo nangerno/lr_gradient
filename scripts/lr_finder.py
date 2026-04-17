@@ -99,6 +99,10 @@ def _can_run(model, tokenizer, batch_size: int, seq_len: int, device: str) -> bo
 
 def find_max_batch_size(model, tokenizer, seq_len: int = 512, device: str = "cuda") -> int:
     """Exponential + binary search for the largest fitting batch size."""
+    if not _can_run(model, tokenizer, 1, seq_len, device):
+        # Avoid low=0 in binary search; real-data path in LR finder retries with smaller batch.
+        return 1
+
     batch = 1
     while _can_run(model, tokenizer, batch, seq_len, device):
         batch *= 2
@@ -106,6 +110,8 @@ def find_max_batch_size(model, tokenizer, seq_len: int = 512, device: str = "cud
     low, high, best = batch // 2, batch, batch // 2
     while low <= high:
         mid = (low + high) // 2
+        if mid < 1:
+            break
         if _can_run(model, tokenizer, mid, seq_len, device):
             best = mid
             low = mid + 1
@@ -323,13 +329,25 @@ def _micro_train_leslie_smith(
     device: str,
     seq_len: int,
     optimizer_name: Optional[str],
+    *,
+    micro_batches_per_lr: int = 1,
+    early_stop_on_divergence: bool = True,
+    divergence_vs_min_loss: float = 10.0,
+    min_points_before_divergence_check: int = 5,
 ) -> tuple[list[float], list[float]]:
     """
     Single continuous run with exponentially increasing LR each step (Leslie Smith).
+
+    ``micro_batches_per_lr``: gradient accumulation — averages gradient over this many
+    batches per LR point for a less noisy loss curve (linear time cost).
+
+    ``early_stop_on_divergence``: stop the ramp when loss spikes vs the running minimum
+    (saves time once the useful LR range has been passed).
     """
     if not lr_schedule:
         return [], []
 
+    mb = max(1, int(micro_batches_per_lr))
     optimizer = _make_optimizer(model, lr_schedule[0], optimizer_name)
     trainable = _trainable_params(model)
     model.train()
@@ -342,34 +360,58 @@ def _micro_train_leslie_smith(
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        batch = next(batch_iter)
         optimizer.zero_grad()
+        batch_losses: list[float] = []
 
-        texts = batch[text_key]
-        inputs = tokenizer(
-            texts,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=seq_len,
-        ).to(device)
+        for _ in range(mb):
+            batch = next(batch_iter)
+            texts = batch[text_key]
+            inputs = tokenizer(
+                texts,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=seq_len,
+            ).to(device)
 
-        with _bf16_autocast(device):
-            outputs = model(**inputs, labels=inputs["input_ids"])
-            loss = outputs.loss
+            with _bf16_autocast(device):
+                outputs = model(**inputs, labels=inputs["input_ids"])
+                loss = outputs.loss
 
-        if not torch.isfinite(loss):
-            lrs_recorded.append(lr)
-            losses_recorded.append(float("nan"))
-            print(
-                "  [LR Finder] Smith ramp: non-finite loss; stopping curve early.",
-                flush=True,
-            )
-            break
+            if not torch.isfinite(loss):
+                lrs_recorded.append(lr)
+                losses_recorded.append(float("nan"))
+                print(
+                    "  [LR Finder] Smith ramp: non-finite loss; stopping curve early.",
+                    flush=True,
+                )
+                return lrs_recorded, losses_recorded
+
+            batch_losses.append(loss.item())
+            (loss / mb).backward()
+
+        mean_loss = float(np.mean(batch_losses))
+
+        if (
+            early_stop_on_divergence
+            and len(losses_recorded) >= min_points_before_divergence_check
+            and losses_recorded
+        ):
+            running_min = min(losses_recorded)
+            if math.isfinite(running_min) and running_min > 0:
+                if mean_loss > divergence_vs_min_loss * running_min:
+                    lrs_recorded.append(lr)
+                    losses_recorded.append(mean_loss)
+                    optimizer.zero_grad(set_to_none=True)
+                    print(
+                        "  [LR Finder] Smith ramp: early stop — loss spiked vs minimum "
+                        f"(lr={lr:.2e}, loss={mean_loss:.4f}); saving wall time.",
+                        flush=True,
+                    )
+                    break
 
         lrs_recorded.append(lr)
-        losses_recorded.append(loss.item())
-        loss.backward()
+        losses_recorded.append(mean_loss)
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         optimizer.step()
 
@@ -390,6 +432,10 @@ def _run_smith_with_auto_batch(
     min_lr: float,
     max_lr: float,
     smith_safety_divisor: float,
+    smith_micro_batches: int = 1,
+    smith_early_stop_divergence: bool = True,
+    smith_divergence_vs_min: float = 10.0,
+    smith_min_points_before_divergence: int = 5,
 ) -> tuple[float, int]:
     trainable_snapshot = {
         name: param.detach().clone()
@@ -418,8 +464,12 @@ def _run_smith_with_auto_batch(
                 lr_schedule,
                 text_key,
                 device,
-                seq_len=seq_len,
-                optimizer_name=optimizer_name,
+                seq_len,
+                optimizer_name,
+                micro_batches_per_lr=smith_micro_batches,
+                early_stop_on_divergence=smith_early_stop_divergence,
+                divergence_vs_min_loss=smith_divergence_vs_min,
+                min_points_before_divergence_check=smith_min_points_before_divergence,
             )
             best_lr = _pick_lr_from_smith_curve(
                 lrs_out,
@@ -563,14 +613,98 @@ def _run_with_auto_batch(
 # Dataset loading — shuffled subset for probing
 # --------------------------------------------------------------------------- #
 
+def _config_bool_or_default(value, default: bool) -> bool:
+    """Parse booleans from JSON/YAML; treat ``None`` as *use default*."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+    return bool(value)
+
+
+def _adaptive_probe_sample_count(
+    n_rows: int,
+    *,
+    frac: float,
+    min_n: int,
+    max_n: int,
+) -> int:
+    """How many rows to use for the LR probe given full dataset size."""
+    if n_rows <= 0:
+        return 0
+    target = max(min_n, int(n_rows * frac))
+    capped = min(target, max_n, n_rows)
+    # Avoid sample_count=0 when rows exist (empty DataLoader would make
+    # ``_iter_batches_forever`` spin forever).
+    return max(1, capped)
+
+
+def _stratified_sample_by_text_length(
+    rows: list[dict],
+    text_key: str,
+    k: int,
+    seed: int,
+) -> list[dict]:
+    """
+    Spread probe examples across short→long texts (quartiles) so the loss
+    landscape is not dominated by a random slice of similar lengths.
+    """
+    rng = random.Random(seed)
+    valid_idx = [i for i, r in enumerate(rows) if (r.get(text_key) or "").strip()]
+    if not valid_idx:
+        valid_idx = list(range(len(rows)))
+    if len(valid_idx) <= k:
+        return [rows[i] for i in valid_idx]
+
+    valid_idx.sort(key=lambda i: len((rows[i].get(text_key) or "")))
+    if k < 4 or len(valid_idx) < 4:
+        rng.shuffle(valid_idx)
+        return [rows[i] for i in valid_idx[:k]]
+
+    n_bins = 4
+    per, rem = divmod(k, n_bins)
+    picked: list[int] = []
+    for b in range(n_bins):
+        lo = b * len(valid_idx) // n_bins
+        hi = (b + 1) * len(valid_idx) // n_bins
+        bucket = valid_idx[lo:hi]
+        take = per + (1 if b < rem else 0)
+        if not bucket or take <= 0:
+            continue
+        rng.shuffle(bucket)
+        picked.extend(bucket[:take])
+
+    if len(picked) < k:
+        pool = [i for i in valid_idx if i not in set(picked)]
+        rng.shuffle(pool)
+        picked.extend(pool[: k - len(picked)])
+    rng.shuffle(picked)
+    return [rows[i] for i in picked[:k]]
+
+
 def _load_sample_dataset(
     dataset_path: str,
     dataset_type_dict: dict,
     train_type: str,
+    *,
+    sample_frac: float = 0.02,
+    sample_min: int = 200,
+    sample_max: int = 3000,
+    stratify_by_length: bool = True,
+    seed: int = 42,
 ) -> tuple[Dataset, str]:
     """
     Load the raw JSON dataset, extract the relevant text column, then return
-    a shuffled subset (~2 %, min 200 rows) together with the text column name.
+    a subset sized from dataset row count (fraction with min/max caps), optionally
+    stratified by raw text length, plus the text column name.
 
     Task columns (all use standard CE loss in the probe, not full DPO/GRPO train loss):
 
@@ -610,13 +744,18 @@ def _load_sample_dataset(
         ds = raw.map(_map_instruct, remove_columns=raw.column_names)
         text_key = "text"
 
-    # Shuffle and take ~2 % (floor 200 examples) so the probe is not too noisy on
-    # small datasets (e.g. 5 k examples → 50 samples was not enough signal).
     data = list(ds)
-    random.seed(42)
-    random.shuffle(data)
-    sample_count = max(200, int(len(data) * 0.02))
-    return Dataset.from_list(data[:sample_count]), text_key
+    sample_count = _adaptive_probe_sample_count(
+        len(data), frac=sample_frac, min_n=sample_min, max_n=sample_max
+    )
+    if stratify_by_length:
+        subset = _stratified_sample_by_text_length(data, text_key, sample_count, seed)
+    else:
+        rng = random.Random(seed)
+        rng.shuffle(data)
+        subset = data[:sample_count]
+
+    return Dataset.from_list(subset), text_key
 
 
 # --------------------------------------------------------------------------- #
@@ -650,6 +789,18 @@ def find_lr(
     # Divide raw steepest-descent LR by this (then clamp to [min_lr, max_lr]).
     # None → 10 for full finetune, 5 for LoRA (steepest point is often ~10× too high to train).
     smith_safety_divisor: Optional[float] = None,
+    # Smith ramp: accumulate this many micro-batches per LR point (stabler curve; linear time).
+    smith_micro_batches: int = 1,
+    # Stop ramp early when loss ≫ min loss so far (saves time past the useful LR band).
+    smith_early_stop_divergence: bool = True,
+    smith_divergence_vs_min: float = 10.0,
+    smith_min_points_before_divergence: int = 5,
+    # Probe subset: size scales with dataset rows; cap avoids huge JSON files.
+    lr_sample_frac: float = 0.02,
+    lr_sample_min: int = 200,
+    lr_sample_max: int = 3000,
+    lr_sample_stratify: bool = True,
+    lr_sample_seed: int = 42,
 ) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
@@ -663,6 +814,7 @@ def find_lr(
     )
     if eff_smith_div <= 0:
         raise ValueError("smith_safety_divisor must be positive.")
+    _mb = max(1, min(8, int(smith_micro_batches)))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     _opt_disp = optimizer_name or "adamw_torch"
@@ -674,6 +826,12 @@ def find_lr(
         + (f"  lr_points={lr_points}" if search_mode == "grid" else "")
         + (
             f"  smith_safety_divisor={eff_smith_div:g}"
+            if search_mode == "leslie_smith"
+            else ""
+        )
+        + (
+            f"  smith_micro_batches={_mb}"
+            f"  smith_early_stop={smith_early_stop_divergence}"
             if search_mode == "leslie_smith"
             else ""
         ),
@@ -730,11 +888,43 @@ def find_lr(
         print(f"[LR Finder] Safe batch size: {safe_batch}", flush=True)
 
         # ------------------------------------------------------------------ #
-        # Load ~2 % dataset sample (see _load_sample_dataset)
+        # Load dataset sample (size from row count; see _load_sample_dataset)
         # ------------------------------------------------------------------ #
+        _frac = float(
+            dataset_type_dict.get("lr_finder_sample_frac", lr_sample_frac)
+        )
+        _smin = int(dataset_type_dict.get("lr_finder_sample_min", lr_sample_min))
+        _smax = int(dataset_type_dict.get("lr_finder_sample_max", lr_sample_max))
+        _strat = _config_bool_or_default(
+            dataset_type_dict.get("lr_finder_stratify_length"),
+            lr_sample_stratify,
+        )
+        _sseed = int(
+            dataset_type_dict.get("lr_finder_sample_seed", lr_sample_seed)
+        )
         print(f"[LR Finder] Loading sample subset of {dataset_path} …", flush=True)
-        sample_ds, text_key = _load_sample_dataset(dataset_path, dataset_type_dict, train_type)
-        print(f"[LR Finder] Sample size: {len(sample_ds)} examples", flush=True)
+        sample_ds, text_key = _load_sample_dataset(
+            dataset_path,
+            dataset_type_dict,
+            train_type,
+            sample_frac=_frac,
+            sample_min=_smin,
+            sample_max=_smax,
+            stratify_by_length=_strat,
+            seed=_sseed,
+        )
+        print(
+            f"[LR Finder] Sample: {len(sample_ds)} rows  "
+            f"(frac={_frac:g}  min={_smin}  max={_smax}  "
+            f"stratify_len={_strat})",
+            flush=True,
+        )
+        if len(sample_ds) == 0:
+            print(
+                "[LR Finder] Empty dataset sample; cannot run LR search.",
+                flush=True,
+            )
+            return None
 
         # ------------------------------------------------------------------ #
         # LR search: Leslie Smith ramp or discrete grid
@@ -759,6 +949,10 @@ def find_lr(
                 min_lr=min_lr,
                 max_lr=max_lr,
                 smith_safety_divisor=eff_smith_div,
+                smith_micro_batches=_mb,
+                smith_early_stop_divergence=smith_early_stop_divergence,
+                smith_divergence_vs_min=smith_divergence_vs_min,
+                smith_min_points_before_divergence=smith_min_points_before_divergence,
             )
         else:
             lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)

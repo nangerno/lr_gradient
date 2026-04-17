@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Callable
+from typing import Any, Dict, Optional, Callable
 import json
 import random
 from utility import log_info, MyDataset
@@ -17,6 +17,15 @@ import yaml
 from state_manager import get_state, set_state
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
+
+
+def _device_map_for_flash_attention(training_args: Any, attn_implementation: str):
+    """Flash Attention 2 expects the model on GPU during init; map the full model to this process's GPU."""
+    if attn_implementation != "flash_attention_2" or not torch.cuda.is_available():
+        return None
+    if getattr(training_args, "world_size", 1) > 1:
+        return {"": LOCAL_RANK}
+    return {"": 0}
 
 
 @dataclass
@@ -91,22 +100,30 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
     else:
         model_class = transformers.AutoModelForCausalLM
 
-    model = model_class.from_pretrained(
-        model_path,
-        attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+    attn_implementation = "flash_attention_2" if not training_args.disable_fa else "eager"
+    if training_args.use_attn_implementation:
+        attn_implementation = training_args.use_attn_implementation
+
+    model_kwargs = dict(
+        attn_implementation=attn_implementation,
         torch_dtype=torch.bfloat16,
         quantization_config=(
             BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
-                attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+                attn_implementation=attn_implementation,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
             if lora_args.q_lora
             else None
         ),
     )
+    dm = _device_map_for_flash_attention(training_args, attn_implementation)
+    if dm is not None:
+        model_kwargs["device_map"] = dm
+
+    model = model_class.from_pretrained(model_path, **model_kwargs)
     # do not resize tokem embeddings in LOra --> will encounter size mismatch error in evaluation 
     # model.resize_token_embeddings(token_nums)
     # convert to lora
@@ -159,12 +176,19 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
         attn_implementation = training_args.use_attn_implementation
         log_info(f"Using {attn_implementation} as the attention implementation")
     log_info(f"Using attn_implementation: {attn_implementation}")
-    
-    model = model_class.from_pretrained(
-        model_path,
-        # trust_remote_code=True, remove this because we already filter the model architecture, it will not be used with liger-kernel 
+
+    model_kwargs = dict(
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_implementation,
+    )
+    dm = _device_map_for_flash_attention(training_args, attn_implementation)
+    if dm is not None:
+        model_kwargs["device_map"] = dm
+
+    model = model_class.from_pretrained(
+        model_path,
+        # trust_remote_code=True, remove this because we already filter the model architecture, it will not be used with liger-kernel
+        **model_kwargs,
     )
     # model.resize_token_embeddings(token_nums)
     return model
