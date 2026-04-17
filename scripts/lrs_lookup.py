@@ -1,3 +1,4 @@
+import os
 from typing import Literal, Optional
 
 from lr_finder import find_lr
@@ -10,6 +11,26 @@ _DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
 def is_dataset_available_for_lr_finder(dataset_path: Optional[str]) -> bool:
     """Empty/missing path skips LR finder (not an error). Callers print a distinct message."""
     return bool(dataset_path and str(dataset_path).strip())
+
+
+def is_instruct_lr_finder_runnable(
+    dataset_path: Optional[str],
+    tokenized_train_path: Optional[str],
+) -> bool:
+    """True if we have raw JSON and/or an on-disk tokenized train file for the instruct probe."""
+    if dataset_path and str(dataset_path).strip():
+        return True
+    return bool(tokenized_train_path and os.path.isfile(tokenized_train_path))
+
+
+def is_dpo_grpo_lr_finder_runnable(
+    dataset_path: Optional[str],
+    training_split_path: Optional[str],
+) -> bool:
+    """True if we have the original dataset path and/or the per-task DPO/GRPO train JSON on disk."""
+    if dataset_path and str(dataset_path).strip():
+        return True
+    return bool(training_split_path and os.path.isfile(training_split_path))
 
 
 _DPO_GRPO_LORA_R = 128
@@ -48,12 +69,18 @@ def get_instruct_lr(
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
     smith_curve_mode: SmithCurveMode = "max_decreasing",
+    tokenized_dataset_path: Optional[str] = None,
+    lr_finder_use_full_tokenized_dataset: bool = False,
+    lr_finder_tokenized_full_cap: int = 10_000,
 ) -> Optional[dict]:
-    if not dataset_path:
+    has_raw = bool(dataset_path and str(dataset_path).strip())
+    has_tok = bool(tokenized_dataset_path and os.path.isfile(tokenized_dataset_path))
+    if not has_raw and not has_tok:
         return None
     return find_lr(
         model_id, model_path, num_params,
-        dataset_path, dataset_type_dict,
+        dataset_path or "",
+        dataset_type_dict,
         train_type="instruct",
         min_lr=1e-6,
         max_lr=9e-3,
@@ -74,6 +101,9 @@ def get_instruct_lr(
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
         smith_curve_mode=smith_curve_mode,
+        tokenized_dataset_path=tokenized_dataset_path,
+        lr_finder_use_full_tokenized_dataset=lr_finder_use_full_tokenized_dataset,
+        lr_finder_tokenized_full_cap=lr_finder_tokenized_full_cap,
     )
 
 
@@ -100,12 +130,16 @@ def get_dpo_lr(
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
     smith_curve_mode: SmithCurveMode = "max_decreasing",
+    tokenized_dataset_path: Optional[str] = None,
 ) -> Optional[dict]:
-    if not dataset_path:
+    if not (dataset_path and str(dataset_path).strip()) and not (
+        tokenized_dataset_path and os.path.isfile(tokenized_dataset_path)
+    ):
         return None
     return find_lr(
         model_id, model_path, num_params,
-        dataset_path, dataset_type_dict,
+        dataset_path or "",
+        dataset_type_dict,
         train_type="dpo",
         min_lr=1e-7,
         max_lr=9e-4,
@@ -129,6 +163,7 @@ def get_dpo_lr(
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
         smith_curve_mode=smith_curve_mode,
+        tokenized_dataset_path=tokenized_dataset_path,
     )
 
 
@@ -156,8 +191,11 @@ def get_grpo_lr(
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
     smith_curve_mode: SmithCurveMode = "max_decreasing",
+    tokenized_dataset_path: Optional[str] = None,
 ) -> Optional[dict]:
-    if not dataset_path:
+    if not (dataset_path and str(dataset_path).strip()) and not (
+        tokenized_dataset_path and os.path.isfile(tokenized_dataset_path)
+    ):
         return None
     seq_len = _grpo_probe_seq_len(max_prompt_length, max_completion_length)
     print(
@@ -167,7 +205,8 @@ def get_grpo_lr(
     )
     return find_lr(
         model_id, model_path, num_params,
-        dataset_path, dataset_type_dict,
+        dataset_path or "",
+        dataset_type_dict,
         train_type="grpo",
         min_lr=1e-5,
         max_lr=9e-4,
@@ -191,6 +230,7 @@ def get_grpo_lr(
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
         smith_curve_mode=smith_curve_mode,
+        tokenized_dataset_path=tokenized_dataset_path,
     )
 
 
@@ -218,8 +258,11 @@ def get_grpo_python_lr(
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
     smith_curve_mode: SmithCurveMode = "max_decreasing",
+    tokenized_dataset_path: Optional[str] = None,
 ) -> Optional[dict]:
-    if not dataset_path:
+    if not (dataset_path and str(dataset_path).strip()) and not (
+        tokenized_dataset_path and os.path.isfile(tokenized_dataset_path)
+    ):
         return None
     seq_len = _grpo_probe_seq_len(max_prompt_length, max_completion_length)
     print(
@@ -229,7 +272,8 @@ def get_grpo_python_lr(
     )
     return find_lr(
         model_id, model_path, num_params,
-        dataset_path, dataset_type_dict,
+        dataset_path or "",
+        dataset_type_dict,
         train_type="grpo",
         min_lr=1e-6,
         max_lr=9e-3,
@@ -253,4 +297,5 @@ def get_grpo_python_lr(
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
         smith_curve_mode=smith_curve_mode,
+        tokenized_dataset_path=tokenized_dataset_path,
     )

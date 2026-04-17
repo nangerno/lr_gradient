@@ -7,7 +7,9 @@ from model_utility import (
     get_gpu_count,
 )
 from copy import deepcopy
-from lrs_lookup import get_dpo_lr, is_dataset_available_for_lr_finder
+import os
+
+from lrs_lookup import get_dpo_lr, is_dpo_grpo_lr_finder_runnable
 
 _DPO_LR_FINDER_SCALE = 0.32
 _DPO_LR_CAP_MULT = 1.75
@@ -186,11 +188,21 @@ def get_training_json(train_info: dict) -> dict:
     }
 
     dataset_path = train_info.get("dataset", "")
-    dataset_type_dict = train_info.get("dataset_type", {})
+    dataset_type_dict = dict(train_info.get("dataset_type", {}))
 
-    if not is_dataset_available_for_lr_finder(dataset_path):
+    dpo_train_path = train_info.get("dpo_train_path")
+    if not dpo_train_path and train_info.get("task_id"):
+        _cand = f"datasets/dpo_train_{train_info['task_id']}.json"
+        dpo_train_path = _cand if os.path.isfile(_cand) else None
+    elif dpo_train_path and not os.path.isfile(dpo_train_path):
+        dpo_train_path = None
+    if dpo_train_path:
+        dataset_type_dict["dpo_train_path"] = dpo_train_path
+
+    if not is_dpo_grpo_lr_finder_runnable(dataset_path, dpo_train_path):
         print(
-            "[LR Finder] Skipping: no dataset path; using param-based learning rate.",
+            "[LR Finder] Skipping: no dataset path and no dpo_train JSON; "
+            "using param-based learning rate.",
             flush=True,
         )
     else:
@@ -215,6 +227,7 @@ def get_training_json(train_info: dict) -> dict:
             lr_sample_seed=run_config["lr_finder_sample_seed"],
             batch_headroom=run_config["lr_finder_batch_headroom"],
             smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
+            tokenized_dataset_path=dpo_train_path,
         )
 
         if lr_result is not None:

@@ -7,8 +7,9 @@ from model_utility import (
     get_gradient_checkpointing,
     get_gpu_count,
 )
+import os
 from copy import deepcopy
-from lrs_lookup import get_grpo_lr, get_grpo_python_lr, is_dataset_available_for_lr_finder
+from lrs_lookup import get_grpo_lr, get_grpo_python_lr, is_dpo_grpo_lr_finder_runnable
 
 
 def _bs_from_param_nums(param_nums) -> int:
@@ -264,17 +265,47 @@ def get_training_json(train_info: dict) -> dict:
         )
 
     dataset_path = train_info.get("dataset", "")
-    dataset_type_dict = train_info.get("dataset_type", {})
+    dataset_type_dict = dict(train_info.get("dataset_type", {}))
+
+    grpo_train_path = train_info.get("grpo_train_path")
+    if not grpo_train_path and train_info.get("task_id"):
+        _cand = f"datasets/grpo_train_{train_info['task_id']}.json"
+        grpo_train_path = _cand if os.path.isfile(_cand) else None
+    elif grpo_train_path and not os.path.isfile(grpo_train_path):
+        grpo_train_path = None
+    if grpo_train_path:
+        dataset_type_dict["grpo_train_path"] = grpo_train_path
+
     has_python_execution = contain_python_execution(train_info["dataset_type"])
     max_prompt_length = int(train_info.get("max_prompt_length", 512))
     max_completion_length = int(run_config["max_completion_length"])
 
-    if not is_dataset_available_for_lr_finder(dataset_path):
+    if not is_dpo_grpo_lr_finder_runnable(dataset_path, grpo_train_path):
         print(
-            "[LR Finder] Skipping: no dataset path; using param-based learning rate.",
+            "[LR Finder] Skipping: no dataset path and no grpo_train JSON; "
+            "using param-based learning rate.",
             flush=True,
         )
     else:
+        _grpo_lr_kwargs = dict(
+            max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length,
+            steps=run_config["lr_finder_steps"],
+            lr_points=run_config["lr_finder_points"],
+            optimizer_name=run_config["optimizer"],
+            smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
+            smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
+            smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
+            smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
+            lr_sample_frac=run_config["lr_finder_sample_frac"],
+            lr_sample_min=run_config["lr_finder_sample_min"],
+            lr_sample_max=run_config["lr_finder_sample_max"],
+            lr_sample_stratify=run_config["lr_finder_stratify_length"],
+            lr_sample_seed=run_config["lr_finder_sample_seed"],
+            batch_headroom=run_config["lr_finder_batch_headroom"],
+            smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
+            tokenized_dataset_path=grpo_train_path,
+        )
         if not has_python_execution:
             lr_result = get_grpo_lr(
                 model_name,
@@ -282,22 +313,7 @@ def get_training_json(train_info: dict) -> dict:
                 param_nums,
                 dataset_path,
                 dataset_type_dict,
-                max_prompt_length=max_prompt_length,
-                max_completion_length=max_completion_length,
-                steps=run_config["lr_finder_steps"],
-                lr_points=run_config["lr_finder_points"],
-                optimizer_name=run_config["optimizer"],
-                smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
-                smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
-                smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
-                smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
-                lr_sample_frac=run_config["lr_finder_sample_frac"],
-                lr_sample_min=run_config["lr_finder_sample_min"],
-                lr_sample_max=run_config["lr_finder_sample_max"],
-                lr_sample_stratify=run_config["lr_finder_stratify_length"],
-                lr_sample_seed=run_config["lr_finder_sample_seed"],
-                batch_headroom=run_config["lr_finder_batch_headroom"],
-                smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
+                **_grpo_lr_kwargs,
             )
         else:
             lr_result = get_grpo_python_lr(
@@ -306,22 +322,7 @@ def get_training_json(train_info: dict) -> dict:
                 param_nums,
                 dataset_path,
                 dataset_type_dict,
-                max_prompt_length=max_prompt_length,
-                max_completion_length=max_completion_length,
-                steps=run_config["lr_finder_steps"],
-                lr_points=run_config["lr_finder_points"],
-                optimizer_name=run_config["optimizer"],
-                smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
-                smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
-                smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
-                smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
-                lr_sample_frac=run_config["lr_finder_sample_frac"],
-                lr_sample_min=run_config["lr_finder_sample_min"],
-                lr_sample_max=run_config["lr_finder_sample_max"],
-                lr_sample_stratify=run_config["lr_finder_stratify_length"],
-                lr_sample_seed=run_config["lr_finder_sample_seed"],
-                batch_headroom=run_config["lr_finder_batch_headroom"],
-                smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
+                **_grpo_lr_kwargs,
             )
 
         if lr_result is not None:

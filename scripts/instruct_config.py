@@ -5,8 +5,9 @@ from model_utility import (
     disable_flash_attention,
     get_gpu_count,
 )
+import os
 from copy import deepcopy
-from lrs_lookup import get_instruct_lr, is_dataset_available_for_lr_finder
+from lrs_lookup import get_instruct_lr, is_instruct_lr_finder_runnable
 
 
 def get_run_cmd(config: dict, gpu_nums: int):
@@ -165,14 +166,31 @@ def get_training_json(train_info: dict) -> dict:
         "lr_finder_smith_curve_mode": train_info.get(
             "lr_finder_smith_curve_mode", "max_decreasing"
         ),
+        # Tokenized probe: use all rows up to this cap when ``lr_finder_use_full_tokenized_dataset`` is True.
+        "lr_finder_use_full_tokenized_dataset": bool(
+            train_info.get("lr_finder_use_full_tokenized_dataset", False)
+        ),
+        "lr_finder_tokenized_full_cap": int(
+            train_info.get("lr_finder_tokenized_full_cap", 10_000)
+        ),
     }
 
     dataset_path = train_info.get("dataset", "")
-    dataset_type_dict = train_info.get("dataset_type", {})
+    dataset_type_dict = dict(train_info.get("dataset_type", {}))
 
-    if not is_dataset_available_for_lr_finder(dataset_path):
+    tokenized_train_path = train_info.get("tokenized_train_path")
+    if not tokenized_train_path and train_info.get("task_id"):
+        _candidate = f"datasets/train_tokenized_{train_info['task_id']}.json"
+        tokenized_train_path = _candidate if os.path.isfile(_candidate) else None
+    elif tokenized_train_path and not os.path.isfile(tokenized_train_path):
+        tokenized_train_path = None
+    if tokenized_train_path:
+        dataset_type_dict["tokenized_train_path"] = tokenized_train_path
+
+    if not is_instruct_lr_finder_runnable(dataset_path, tokenized_train_path):
         print(
-            "[LR Finder] Skipping: no dataset path; using param-based learning rate.",
+            "[LR Finder] Skipping: no raw dataset path and no tokenized train file; "
+            "using param-based learning rate.",
             flush=True,
         )
     else:
@@ -197,6 +215,11 @@ def get_training_json(train_info: dict) -> dict:
             lr_sample_seed=run_config["lr_finder_sample_seed"],
             batch_headroom=run_config["lr_finder_batch_headroom"],
             smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
+            tokenized_dataset_path=tokenized_train_path,
+            lr_finder_use_full_tokenized_dataset=run_config[
+                "lr_finder_use_full_tokenized_dataset"
+            ],
+            lr_finder_tokenized_full_cap=run_config["lr_finder_tokenized_full_cap"],
         )
 
         if lr_result is not None:

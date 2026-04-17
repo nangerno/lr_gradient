@@ -1,8 +1,9 @@
 import contextlib
 import json
 import math
+import os
 import random
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import numpy as np
 import torch
@@ -10,6 +11,11 @@ from datasets import Dataset, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from utility import pad_inputs
+
+# Instruct: probe uses the same padded token tensors as ``MyDataset`` / ``train_instruct``.
+TOKENIZED_BATCH_KEY = "__lr_finder_tokenized__"
 
 try:
     import bitsandbytes as bnb
@@ -341,15 +347,21 @@ def _micro_train(
             break
         optimizer.zero_grad()
 
-        texts = batch[text_key]
-        # Truncate to seq_len so memory usage matches the find_max_batch_size probe.
-        inputs = tokenizer(
-            texts, return_tensors="pt", truncation=True, padding=True,
-            max_length=seq_len,
-        ).to(device)
+        if text_key == TOKENIZED_BATCH_KEY:
+            inputs = {k: v.to(device) for k, v in batch.items()}
+        else:
+            texts = batch[text_key]
+            # Truncate to seq_len so memory usage matches the find_max_batch_size probe.
+            inputs = tokenizer(
+                texts, return_tensors="pt", truncation=True, padding=True,
+                max_length=seq_len,
+            ).to(device)
 
         with _bf16_autocast(device):
-            outputs = model(**inputs, labels=inputs["input_ids"])
+            if text_key == TOKENIZED_BATCH_KEY:
+                outputs = model(**inputs, labels=inputs["labels"])
+            else:
+                outputs = model(**inputs, labels=inputs["input_ids"])
             loss = outputs.loss
 
         if not torch.isfinite(loss):
@@ -420,17 +432,23 @@ def _micro_train_leslie_smith(
 
         for _ in range(mb):
             batch = next(batch_iter)
-            texts = batch[text_key]
-            inputs = tokenizer(
-                texts,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=seq_len,
-            ).to(device)
+            if text_key == TOKENIZED_BATCH_KEY:
+                inputs = {k: v.to(device) for k, v in batch.items()}
+            else:
+                texts = batch[text_key]
+                inputs = tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding=True,
+                    max_length=seq_len,
+                ).to(device)
 
             with _bf16_autocast(device):
-                outputs = model(**inputs, labels=inputs["input_ids"])
+                if text_key == TOKENIZED_BATCH_KEY:
+                    outputs = model(**inputs, labels=inputs["labels"])
+                else:
+                    outputs = model(**inputs, labels=inputs["input_ids"])
                 loss = outputs.loss
 
             if not torch.isfinite(loss):
@@ -492,6 +510,7 @@ def _run_smith_with_auto_batch(
     smith_divergence_vs_min: float = 10.0,
     smith_min_points_before_divergence: int = 5,
     smith_curve_mode: Literal["steepest", "max_decreasing"] = "steepest",
+    collate_fn: Optional[Callable] = None,
 ) -> tuple[float, int]:
     trainable_snapshot = {
         name: param.detach().clone()
@@ -513,7 +532,12 @@ def _run_smith_with_auto_batch(
     while batch_size >= 1:
         try:
             _restore_trainable_weights()
-            dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            dl = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+            )
             lrs_out, losses_out = _micro_train_leslie_smith(
                 model,
                 tokenizer,
@@ -645,6 +669,7 @@ def _run_with_auto_batch(
     device: str,
     seq_len: int = 512,
     optimizer_name: Optional[str] = None,
+    collate_fn: Optional[Callable] = None,
 ) -> tuple[float, int]:
     trainable_snapshot = {
         name: param.detach().clone()
@@ -667,7 +692,12 @@ def _run_with_auto_batch(
             _restore_trainable_weights()
             # shuffle=False: _load_sample_dataset already shuffled; keeps batch order
             # identical across LR candidates so losses are comparable.
-            dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            dl = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+            )
             best_lr = _pick_best_lr(
                 model,
                 tokenizer,
@@ -792,6 +822,138 @@ def _stratified_sample_by_text_length(
     return [rows[i] for i in picked[:k]]
 
 
+def _stratified_sample_by_token_length(
+    rows: list[dict],
+    k: int,
+    seed: int,
+) -> list[dict]:
+    """Stratify probe rows by ``len(input_ids)`` (matches training sequence lengths)."""
+    rng = random.Random(seed)
+    valid_idx = [
+        i
+        for i, r in enumerate(rows)
+        if isinstance(r.get("input_ids"), list) and len(r["input_ids"]) > 0
+    ]
+    if not valid_idx:
+        valid_idx = list(range(len(rows)))
+    if len(valid_idx) <= k:
+        return [rows[i] for i in valid_idx]
+
+    valid_idx.sort(key=lambda i: len(rows[i]["input_ids"]))
+    if k < 4 or len(valid_idx) < 4:
+        rng.shuffle(valid_idx)
+        return [rows[i] for i in valid_idx[:k]]
+
+    n_bins = 4
+    per, rem = divmod(k, n_bins)
+    picked: list[int] = []
+    for b in range(n_bins):
+        lo = b * len(valid_idx) // n_bins
+        hi = (b + 1) * len(valid_idx) // n_bins
+        bucket = valid_idx[lo:hi]
+        take = per + (1 if b < rem else 0)
+        if not bucket or take <= 0:
+            continue
+        rng.shuffle(bucket)
+        picked.extend(bucket[:take])
+
+    if len(picked) < k:
+        pool = [i for i in valid_idx if i not in set(picked)]
+        rng.shuffle(pool)
+        picked.extend(pool[: k - len(picked)])
+    rng.shuffle(picked)
+    return [rows[i] for i in picked[:k]]
+
+
+def _normalize_tokenized_row(ex: dict) -> Optional[dict]:
+    """Keep only keys needed for ``pad_inputs`` / causal LM forward."""
+    ids = ex.get("input_ids")
+    if not isinstance(ids, list) or not ids:
+        return None
+    attn = ex.get("attention_mask")
+    if not isinstance(attn, list) or len(attn) != len(ids):
+        attn = [1] * len(ids)
+    lab = ex.get("labels")
+    if not isinstance(lab, list) or len(lab) != len(ids):
+        lab = list(ids)
+    return {
+        "input_ids": [int(x) for x in ids],
+        "attention_mask": [int(x) for x in attn],
+        "labels": [int(x) for x in lab],
+    }
+
+
+def _stack_tokenized_batch(
+    rows: list[dict],
+    tokenizer: AutoTokenizer,
+    seq_len: int,
+) -> dict:
+    """Pad each example to ``seq_len`` like ``MyDataset``, then stack to batch tensors."""
+    tensors: dict[str, list[torch.Tensor]] = {"input_ids": [], "attention_mask": [], "labels": []}
+    for raw in rows:
+        dp = _normalize_tokenized_row(raw)
+        if dp is None:
+            continue
+        padded = pad_inputs(tokenizer, dp, seq_len, tokenizer.padding_side)
+        for key in tensors:
+            tensors[key].append(torch.tensor(padded[key], dtype=torch.long))
+    if not tensors["input_ids"]:
+        raise RuntimeError("tokenized batch has no valid rows")
+    return {k: torch.stack(v, dim=0) for k, v in tensors.items()}
+
+
+def _make_tokenized_collate_fn(
+    tokenizer: AutoTokenizer,
+    seq_len: int,
+) -> Callable[[list[dict]], dict]:
+    def _collate(batch: list[dict]) -> dict:
+        return _stack_tokenized_batch(batch, tokenizer, seq_len)
+
+    return _collate
+
+
+def _load_tokenized_sample_dataset(
+    tokenized_path: str,
+    *,
+    sample_frac: float,
+    sample_min: int,
+    sample_max: int,
+    stratify_by_length: bool,
+    seed: int,
+    use_full: bool,
+    full_cap: int,
+) -> tuple[Dataset, str]:
+    with open(tokenized_path, "r", encoding="utf-8") as f:
+        raw_list = json.load(f)
+    if not isinstance(raw_list, list):
+        raise ValueError(f"Tokenized dataset must be a JSON list: {tokenized_path}")
+    data = []
+    for ex in raw_list:
+        if isinstance(ex, dict):
+            norm = _normalize_tokenized_row(ex)
+            if norm is not None:
+                data.append(norm)
+    n_rows = len(data)
+    if n_rows == 0:
+        return Dataset.from_list([]), TOKENIZED_BATCH_KEY
+
+    if use_full:
+        sample_count = min(n_rows, max(1, full_cap))
+    else:
+        sample_count = _adaptive_probe_sample_count(
+            n_rows, frac=sample_frac, min_n=sample_min, max_n=sample_max
+        )
+
+    if stratify_by_length:
+        subset = _stratified_sample_by_token_length(data, sample_count, seed)
+    else:
+        rng = random.Random(seed)
+        rng.shuffle(data)
+        subset = data[:sample_count]
+
+    return Dataset.from_list(subset), TOKENIZED_BATCH_KEY
+
+
 def _load_sample_dataset(
     dataset_path: str,
     dataset_type_dict: dict,
@@ -896,6 +1058,14 @@ def find_lr(
     # min(B_train, batch that fits on real tokenized batches).
     batch_headroom: float = 0.8,
     smith_curve_mode: Literal["steepest", "max_decreasing"] = "max_decreasing",
+    # Instruct: JSON list of {input_ids, attention_mask, labels} (``train_tokenized_*.json``).
+    # DPO/GRPO: optional path to the per-task training JSON (``dpo_train_*.json`` / ``grpo_train_*.json``)
+    # — same text columns as ``train_dpo`` / ``train_grpo``; probe uses 2% (or full flags) of that file.
+    tokenized_dataset_path: Optional[str] = None,
+    # If True, use (almost) all tokenized rows, capped by ``lr_finder_tokenized_full_cap`` (memory safety).
+    # If False, use the same adaptive fraction as raw JSON (default ~2% with min/max).
+    lr_finder_use_full_tokenized_dataset: bool = False,
+    lr_finder_tokenized_full_cap: int = 10_000,
 ) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
@@ -1013,23 +1183,98 @@ def find_lr(
         _sseed = int(
             dataset_type_dict.get("lr_finder_sample_seed", lr_sample_seed)
         )
-        print(f"[LR Finder] Loading sample subset of {dataset_path} …", flush=True)
-        sample_ds, text_key = _load_sample_dataset(
-            dataset_path,
-            dataset_type_dict,
-            train_type,
-            sample_frac=_frac,
-            sample_min=_smin,
-            sample_max=_smax,
-            stratify_by_length=_strat,
-            seed=_sseed,
+
+        # DPO/GRPO: prefer the on-disk training split (same JSON as production training).
+        if train_type in ("dpo", "grpo"):
+            _split = (
+                tokenized_dataset_path
+                or dataset_type_dict.get("dpo_train_path")
+                or dataset_type_dict.get("grpo_train_path")
+            )
+            if _split and os.path.isfile(_split):
+                text_probe_path = _split
+                print(
+                    f"[LR Finder] Probe uses training-split JSON (same as train_{train_type}): "
+                    f"{text_probe_path}",
+                    flush=True,
+                )
+            else:
+                text_probe_path = dataset_path
+        else:
+            text_probe_path = dataset_path
+
+        _tok_path = (
+            tokenized_dataset_path
+            or dataset_type_dict.get("tokenized_train_path")
+            or dataset_type_dict.get("tokenized_train")
         )
-        print(
-            f"[LR Finder] Sample: {len(sample_ds)} rows  "
-            f"(frac={_frac:g}  min={_smin}  max={_smax}  "
-            f"stratify_len={_strat})",
-            flush=True,
+        _use_full_tok = _config_bool_or_default(
+            dataset_type_dict.get("lr_finder_use_full_tokenized_dataset"),
+            lr_finder_use_full_tokenized_dataset,
         )
+        _tok_cap = int(
+            dataset_type_dict.get(
+                "lr_finder_tokenized_full_cap", lr_finder_tokenized_full_cap
+            )
+        )
+        use_tokenized = (
+            train_type == "instruct"
+            and _tok_path
+            and os.path.isfile(_tok_path)
+        )
+
+        collate_fn: Optional[Callable] = None
+        if use_tokenized:
+            print(
+                f"[LR Finder] Loading tokenized training data from {_tok_path} …",
+                flush=True,
+            )
+            sample_ds, text_key = _load_tokenized_sample_dataset(
+                _tok_path,
+                sample_frac=_frac,
+                sample_min=_smin,
+                sample_max=_smax,
+                stratify_by_length=_strat,
+                seed=_sseed,
+                use_full=_use_full_tok,
+                full_cap=max(1, _tok_cap),
+            )
+            collate_fn = _make_tokenized_collate_fn(tokenizer, seq_len)
+            mode = (
+                f"full rows (cap={_tok_cap})"
+                if _use_full_tok
+                else f"adaptive subset frac={_frac:g} min={_smin} max={_smax}"
+            )
+            print(
+                f"[LR Finder] Tokenized sample: {len(sample_ds)} rows  ({mode}; "
+                f"stratify_by_token_len={_strat})",
+                flush=True,
+            )
+        else:
+            if not text_probe_path or not str(text_probe_path).strip():
+                print(
+                    "[LR Finder] No dataset path and no usable training-split / tokenized file; "
+                    "cannot run LR search.",
+                    flush=True,
+                )
+                return None
+            print(f"[LR Finder] Loading sample subset of {text_probe_path} …", flush=True)
+            sample_ds, text_key = _load_sample_dataset(
+                text_probe_path,
+                dataset_type_dict,
+                train_type,
+                sample_frac=_frac,
+                sample_min=_smin,
+                sample_max=_smax,
+                stratify_by_length=_strat,
+                seed=_sseed,
+            )
+            print(
+                f"[LR Finder] Sample: {len(sample_ds)} rows  "
+                f"(frac={_frac:g}  min={_smin}  max={_smax}  "
+                f"stratify_len={_strat})",
+                flush=True,
+            )
         if len(sample_ds) == 0:
             print(
                 "[LR Finder] Empty dataset sample; cannot run LR search.",
@@ -1065,6 +1310,7 @@ def find_lr(
                 smith_divergence_vs_min=smith_divergence_vs_min,
                 smith_min_points_before_divergence=smith_min_points_before_divergence,
                 smith_curve_mode=_curve_mode,
+                collate_fn=collate_fn,
             )
         else:
             lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)
@@ -1083,6 +1329,7 @@ def find_lr(
                 device,
                 seq_len=seq_len,
                 optimizer_name=optimizer_name,
+                collate_fn=collate_fn,
             )
 
         train_batch = min(b_train, probe_batch)
