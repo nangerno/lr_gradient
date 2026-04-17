@@ -46,6 +46,18 @@ def apply_tokenized_lr_finder_to_run_config(
     dataset_type_dict["lr_finder_peak_rel_slack"] = float(
         run_config.get("lr_finder_peak_rel_slack", 0.28)
     )
+    dataset_type_dict["lr_finder_min_probe_rows"] = int(
+        run_config.get("lr_finder_min_probe_rows", 32)
+    )
+    dataset_type_dict["lr_finder_probe_fraction"] = float(
+        run_config.get("lr_finder_probe_fraction", 0.02)
+    )
+    dataset_type_dict["lr_finder_target_tokens_min"] = int(
+        run_config.get("lr_finder_target_tokens_min", 50_000)
+    )
+    dataset_type_dict["lr_finder_target_tokens_max"] = int(
+        run_config.get("lr_finder_target_tokens_max", 200_000)
+    )
 
     if not is_instruct_lr_finder_runnable(tokenized_train_path):
         print(

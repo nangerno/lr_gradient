@@ -411,13 +411,51 @@ def _make_tokenized_collate_fn(
     return _collate
 
 
-def _load_tokenized_probe_two_percent(
+def _row_token_count(row: dict) -> int:
+    ids = row.get("input_ids")
+    return len(ids) if isinstance(ids, list) else 0
+
+
+def _expand_indices_to_token_targets(
+    data: list[dict],
+    picked: set[int],
+    rng: random.Random,
+    target_tokens_min: int,
+    target_tokens_max: int,
+) -> set[int]:
+    """Add rows until total tokens ≥ ``target_tokens_min`` (cap at ``target_tokens_max`` sum)."""
+    total = sum(_row_token_count(data[i]) for i in picked)
+    if total >= target_tokens_min:
+        return picked
+    pool = [i for i in range(len(data)) if i not in picked]
+    rng.shuffle(pool)
+    for idx in pool:
+        if total >= target_tokens_min:
+            break
+        picked.add(idx)
+        total += _row_token_count(data[idx])
+        if total >= target_tokens_max:
+            break
+    return picked
+
+
+def _load_tokenized_probe_dataset(
     tokenized_path: str,
     *,
     stratify_by_length: bool,
     seed: int,
+    min_probe_rows: int = 32,
+    probe_fraction: float = 0.02,
+    target_tokens_min: int = 50_000,
+    target_tokens_max: int = 200_000,
 ) -> tuple[Dataset, str]:
-    """Exactly 2% of rows (min 1), same format as ``MyDataset`` / ``train_tokenized_*.json``."""
+    """
+    Probe subset for LR search: at least ``max(min_probe_rows, ceil(probe_fraction * N))``
+    rows (capped by ``N``), then expand with random rows until total token count reaches
+    ``target_tokens_min`` when data allows (up to ``target_tokens_max`` total tokens).
+
+    Same JSON format as ``MyDataset`` / ``train_tokenized_*.json``.
+    """
     with open(tokenized_path, "r", encoding="utf-8") as f:
         raw_list = json.load(f)
     if not isinstance(raw_list, list):
@@ -430,19 +468,34 @@ def _load_tokenized_probe_two_percent(
                 data.append(norm)
     n_rows = len(data)
     if n_rows == 0:
-        return Dataset.from_list([]), TOKENIZED_BATCH_KEY
+        return Dataset.from_list([]), TOKENIZED_BATCH_KEY, 0
 
-    sample_count = max(1, int(n_rows * 0.02))
-    sample_count = min(sample_count, n_rows)
+    pf = max(0.0, min(1.0, float(probe_fraction)))
+    base_k = max(min_probe_rows, int(math.ceil(n_rows * pf)))
+    base_k = max(1, min(base_k, n_rows))
 
+    rng = random.Random(seed)
     if stratify_by_length:
-        subset = _stratified_sample_by_token_length(data, sample_count, seed)
+        initial_rows = _stratified_sample_by_token_length(data, base_k, seed)
+        picked = {
+            i
+            for i, r in enumerate(data)
+            if any(r is x for x in initial_rows)
+        }
+        if not picked:
+            picked = set(range(min(base_k, n_rows)))
     else:
-        rng = random.Random(seed)
-        rng.shuffle(data)
-        subset = data[:sample_count]
+        order = list(range(n_rows))
+        rng.shuffle(order)
+        picked = set(order[:base_k])
 
-    return Dataset.from_list(subset), TOKENIZED_BATCH_KEY
+    picked = _expand_indices_to_token_targets(
+        data, picked, rng, target_tokens_min, target_tokens_max
+    )
+    subset = [data[i] for i in sorted(picked)]
+    total_tokens = sum(_row_token_count(r) for r in subset)
+
+    return Dataset.from_list(subset), TOKENIZED_BATCH_KEY, total_tokens
 
 
 # --------------------------------------------------------------------------- #
@@ -508,7 +561,7 @@ def find_lr(
     print(
         f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
-        + f"  optim={_opt_disp}  probe=2%_tokenized  lr_probe_points={_points}"
+        + f"  optim={_opt_disp}  probe=tokenized(min_rows+fraction+tok_budget)  lr_probe_points={_points}"
         + f"  mini_train_batches={_mini_b}"
         + f"  peak_rel_slack={_peak_sl:g}",
         flush=True,
@@ -586,19 +639,29 @@ def find_lr(
         )
         _sseed = int(dataset_type_dict.get("lr_finder_sample_seed", lr_sample_seed))
 
+        _min_rows = int(dataset_type_dict.get("lr_finder_min_probe_rows", 32))
+        _probe_frac = float(dataset_type_dict.get("lr_finder_probe_fraction", 0.02))
+        _tok_min = int(dataset_type_dict.get("lr_finder_target_tokens_min", 50_000))
+        _tok_max = int(dataset_type_dict.get("lr_finder_target_tokens_max", 200_000))
+
         print(
-            f"[LR Finder] Loading 2% subset of tokenized data: {tokenized_dataset_path} …",
+            f"[LR Finder] Loading probe subset from tokenized data: {tokenized_dataset_path} …",
             flush=True,
         )
-        sample_ds, _ = _load_tokenized_probe_two_percent(
+        sample_ds, _, probe_tokens = _load_tokenized_probe_dataset(
             tokenized_dataset_path,
             stratify_by_length=_strat,
             seed=_sseed,
+            min_probe_rows=max(1, _min_rows),
+            probe_fraction=_probe_frac,
+            target_tokens_min=max(0, _tok_min),
+            target_tokens_max=max(_tok_min, _tok_max),
         )
         collate_fn = _make_tokenized_collate_fn(tokenizer, seq_len)
         print(
-            f"[LR Finder] Probe rows: {len(sample_ds)}  (2% of tokenized set; "
-            f"stratify_by_token_len={_strat})",
+            f"[LR Finder] Probe rows: {len(sample_ds)}  ~{probe_tokens} tokens  "
+            f"(floor=max({_min_rows},{_probe_frac:g}·N), target {_tok_min}–{_tok_max} tok; "
+            f"stratify={_strat})",
             flush=True,
         )
 

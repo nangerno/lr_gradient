@@ -232,6 +232,10 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
         "lr_finder_peak_rel_slack": float(train_info.get("lr_finder_peak_rel_slack", 0.28)),
+        "lr_finder_min_probe_rows": int(train_info.get("lr_finder_min_probe_rows", 32)),
+        "lr_finder_probe_fraction": float(train_info.get("lr_finder_probe_fraction", 0.02)),
+        "lr_finder_target_tokens_min": int(train_info.get("lr_finder_target_tokens_min", 50_000)),
+        "lr_finder_target_tokens_max": int(train_info.get("lr_finder_target_tokens_max", 200_000)),
     }
 
     _slow_reward_funcs = if_contain_slow_reward_function(train_info["dataset_type"])
