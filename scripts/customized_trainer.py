@@ -391,11 +391,12 @@ class WhenToEvalHandler:
         self.max_steps = max_steps
 
     def __call__(self, global_step: int) -> dict:
-        
-        if self.steps_per_epoch != -1 and global_step % self.steps_per_epoch == 0 and global_step > 1:
+        # ``steps_per_epoch`` can be 0 when the effective global batch is larger than
+        # ``len(train_ds)`` (integer division). Never use ``% 0``.
+        if self.steps_per_epoch > 0 and global_step % self.steps_per_epoch == 0 and global_step > 1:
             return {"eval": True, "reason": "epoch"}
-        
-        if self.periodic_save_steps != -1 and global_step % self.periodic_save_steps == 0 and global_step > 1:
+
+        if self.periodic_save_steps > 0 and global_step % self.periodic_save_steps == 0 and global_step > 1:
             return {"eval": True, "reason": "periodic"}
         
         if self.save_before_remaining_time > 0 and not self.run_eval:

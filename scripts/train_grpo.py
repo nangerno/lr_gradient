@@ -428,6 +428,13 @@ def main():
         )
     log_info(f"periodic_save_steps: {periodic_save_steps}")
 
+    steps_per_epoch_for_eval = total_steps_per_epoch if total_steps_per_epoch > 0 else -1
+    if total_steps_per_epoch <= 0:
+        log_info(
+            "total_steps_per_epoch is 0 (effective batch ≥ dataset length); "
+            "epoch-triggered eval in WhenToEvalHandler is disabled (steps_per_epoch=-1)."
+        )
+
     training_args.save_only_model = True  # only save the model, not the optimizer
  
     if training_args.gradient_checkpointing:
@@ -465,7 +472,7 @@ def main():
         callbacks=[
             NaNSafeCallback(),
             GRPOCustomEvalSaveCallback(
-                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=steps_per_epoch_for_eval, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],

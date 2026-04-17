@@ -385,9 +385,16 @@ def main():
         os.remove(success_file)
     
     checking_step = train_request["checking_step"]
-    if checking_step >= total_steps_per_epoch:
-        checking_step = total_steps_per_epoch - 2
-    
+    if total_steps_per_epoch > 0 and checking_step >= total_steps_per_epoch:
+        checking_step = max(1, total_steps_per_epoch - 2)
+
+    steps_per_epoch_for_eval = total_steps_per_epoch if total_steps_per_epoch > 0 else -1
+    if total_steps_per_epoch <= 0:
+        log_info(
+            "total_steps_per_epoch is 0 (effective batch ≥ dataset length); "
+            "epoch-triggered eval in WhenToEvalHandler is disabled (steps_per_epoch=-1)."
+        )
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -396,7 +403,7 @@ def main():
         eval_dataset=dev_ds,
         callbacks=[
             InstructCustomEvalSaveCallback(
-                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=steps_per_epoch_for_eval, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
