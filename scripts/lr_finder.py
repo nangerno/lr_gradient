@@ -457,6 +457,10 @@ def find_lr(
     ``labels`` — never GRPO reward functions or rollouts. For GRPO jobs with slow
     rewards, pass ``grpo_slow_reward_proxy_probe=True`` so logs state explicitly
     that expensive rewards are not used in this phase.
+
+    Intended order (callers): **tokenize** → **safe batch** (``find_max_batch_size``
+    then ``safe_batch``) → **LR grid** on 2% tokenized data at ``batch ≤ safe_batch``
+    → set ``batch_size`` / ``lr`` on the real training run.
     """
     if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         print(

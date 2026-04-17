@@ -82,6 +82,10 @@ def ensure_positive_steps_per_epoch(training_args: Any, effective_sample_count: 
 
 
 def pad_sequence(sequence: list[int], pad_value: int, max_length: int, padding_side: str) -> list[int]:
+    if len(sequence) > max_length:
+        # Without truncation, pad count goes negative and the long row is unchanged,
+        # so batches mix lengths (e.g. 1024 vs 1650) and torch.stack fails.
+        sequence = sequence[-max_length:] if padding_side == "left" else sequence[:max_length]
     if padding_side == "left":
         return [pad_value] * (max_length - len(sequence)) + sequence
     else:

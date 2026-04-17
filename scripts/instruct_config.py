@@ -6,7 +6,7 @@ from model_utility import (
     get_gpu_count,
 )
 from copy import deepcopy
-from lrs_lookup import apply_tokenized_lr_finder_to_run_config
+from lrs_lookup import apply_tokenized_lr_finder_to_run_config, effective_lr_finder_seq_len
 
 
 def get_run_cmd(config: dict, gpu_nums: int):
@@ -155,7 +155,7 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "lr_finder_mini_train_batches": int(
             train_info.get("lr_finder_mini_train_batches", 3)
         ),
-        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
+        "lr_finder_seq_len": effective_lr_finder_seq_len(train_info),
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),

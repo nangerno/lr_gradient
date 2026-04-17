@@ -94,11 +94,12 @@ def _train_bundle_after_tokenize(
     get_training_json_fn,
 ) -> dict:
     """
-    After ``tokenize_*.py`` has written ``datasets/train_tokenized_{task_id}.json``,
-    re-run config generation with the LR finder on that file.
+    Step 2–4 of the pipeline: with ``train_tokenized_{task_id}.json`` on disk, rebuild
+    config via ``get_training_json(..., run_lr_finder=True)`` so safe batch + LR come
+    from that file and land in ``run_cmd`` for real training.
 
-    Instruct/chat tasks always emit this file; DPO/GRPO tokenizers may not — if the
-    file is missing, the bundle is unchanged (param-based LR/batch).
+    Instruct/chat always produce the tokenized file; DPO/GRPO may not — if missing,
+    the bundle is unchanged (param-based LR/batch).
     """
     tokenized_path = os.path.join(ds_folder, f"train_tokenized_{task_id}.json")
     if not os.path.isfile(tokenized_path):
@@ -485,6 +486,13 @@ def main():
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
 
+    # Training config pipeline (tokenized LR/batch probe when train_tokenized_*.json exists):
+    # 1) Tokenize dataset → datasets/train_tokenized_{task_id}.json (and dev_*).
+    # 2) Safe batch: synthetic max batch × headroom, then fit on real tokenized batches
+    #    (implemented inside lr_finder.find_lr).
+    # 3) LR: mini-train grid on ~2% of that JSON at batch ≤ safe batch (SFT CE).
+    # 4) Apply finder batch_size + learning_rate to the real train command (run_cmd).
+    #
     # Phase 1: param-based LR/batch only — tokenized JSON does not exist yet.
     train_info = get_training_json_fn(train_info, run_lr_finder=False)
 

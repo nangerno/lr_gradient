@@ -4,6 +4,19 @@ from typing import Optional
 from lr_finder import find_lr
 
 
+def effective_lr_finder_seq_len(train_info: dict, default: int = 1024) -> int:
+    if train_info.get("lr_finder_seq_len") is not None:
+        return max(1, int(train_info["lr_finder_seq_len"]))
+    ml = train_info.get("max_length")
+    try:
+        ml_int = int(ml)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        ml_int = -1
+    if ml_int > 0:
+        return ml_int
+    return default
+
+
 def resolve_tokenized_train_path(train_info: dict) -> Optional[str]:
     """Resolve ``train_tokenized_*.json``: explicit path, or ``datasets/train_tokenized_{task_id}.json``."""
     tokenized_train_path = train_info.get("tokenized_train_path")
@@ -25,16 +38,6 @@ def apply_tokenized_lr_finder_to_run_config(
     fallback_learning_rate: float,
     grpo_slow_reward_proxy_probe: bool = False,
 ) -> None:
-    """
-    When a tokenized instruct JSON exists, run the mini-train probe and set
-    ``learning_rate`` and ``batch_size`` on ``run_config``.
-
-    Expects ``run_config`` to include ``lr_finder_*`` keys (same as ``instruct_config``).
-
-    For GRPO jobs that use slow/heavy reward functions, pass
-    ``grpo_slow_reward_proxy_probe=True``: the probe still uses **SFT CE only**
-    (never reward models); full training afterward uses real rewards.
-    """
     dataset_type_dict = dict(train_info.get("dataset_type", {}))
     tokenized_train_path = resolve_tokenized_train_path(train_info)
     if tokenized_train_path:
