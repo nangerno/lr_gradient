@@ -1,5 +1,8 @@
-from typing import Optional
+from typing import Literal, Optional
+
 from lr_finder import find_lr
+
+SmithCurveMode = Literal["steepest", "max_decreasing"]
 
 _DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
 
@@ -43,6 +46,8 @@ def get_instruct_lr(
     lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
+    batch_headroom: float = 0.8,
+    smith_curve_mode: SmithCurveMode = "max_decreasing",
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -67,6 +72,8 @@ def get_instruct_lr(
         lr_sample_max=lr_sample_max,
         lr_sample_stratify=lr_sample_stratify,
         lr_sample_seed=lr_sample_seed,
+        batch_headroom=batch_headroom,
+        smith_curve_mode=smith_curve_mode,
     )
 
 
@@ -91,6 +98,8 @@ def get_dpo_lr(
     lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
+    batch_headroom: float = 0.8,
+    smith_curve_mode: SmithCurveMode = "max_decreasing",
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -118,6 +127,8 @@ def get_dpo_lr(
         lr_sample_max=lr_sample_max,
         lr_sample_stratify=lr_sample_stratify,
         lr_sample_seed=lr_sample_seed,
+        batch_headroom=batch_headroom,
+        smith_curve_mode=smith_curve_mode,
     )
 
 
@@ -143,6 +154,8 @@ def get_grpo_lr(
     lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
+    batch_headroom: float = 0.8,
+    smith_curve_mode: SmithCurveMode = "max_decreasing",
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -176,6 +189,8 @@ def get_grpo_lr(
         lr_sample_max=lr_sample_max,
         lr_sample_stratify=lr_sample_stratify,
         lr_sample_seed=lr_sample_seed,
+        batch_headroom=batch_headroom,
+        smith_curve_mode=smith_curve_mode,
     )
 
 
@@ -201,6 +216,8 @@ def get_grpo_python_lr(
     lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
+    batch_headroom: float = 0.8,
+    smith_curve_mode: SmithCurveMode = "max_decreasing",
 ) -> Optional[dict]:
     if not dataset_path:
         return None
@@ -234,4 +251,6 @@ def get_grpo_python_lr(
         lr_sample_max=lr_sample_max,
         lr_sample_stratify=lr_sample_stratify,
         lr_sample_seed=lr_sample_seed,
+        batch_headroom=batch_headroom,
+        smith_curve_mode=smith_curve_mode,
     )

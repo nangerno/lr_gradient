@@ -240,6 +240,10 @@ def get_training_json(train_info: dict) -> dict:
         "lr_finder_sample_max": int(train_info.get("lr_finder_sample_max", 3000)),
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
+        "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
+        "lr_finder_smith_curve_mode": train_info.get(
+            "lr_finder_smith_curve_mode", "max_decreasing"
+        ),
     }
 
     train_request = deepcopy(train_info)
@@ -292,6 +296,8 @@ def get_training_json(train_info: dict) -> dict:
                 lr_sample_max=run_config["lr_finder_sample_max"],
                 lr_sample_stratify=run_config["lr_finder_stratify_length"],
                 lr_sample_seed=run_config["lr_finder_sample_seed"],
+                batch_headroom=run_config["lr_finder_batch_headroom"],
+                smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
             )
         else:
             lr_result = get_grpo_python_lr(
@@ -314,6 +320,8 @@ def get_training_json(train_info: dict) -> dict:
                 lr_sample_max=run_config["lr_finder_sample_max"],
                 lr_sample_stratify=run_config["lr_finder_stratify_length"],
                 lr_sample_seed=run_config["lr_finder_sample_seed"],
+                batch_headroom=run_config["lr_finder_batch_headroom"],
+                smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
             )
 
         if lr_result is not None:

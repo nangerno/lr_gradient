@@ -97,11 +97,17 @@ def _can_run(model, tokenizer, batch_size: int, seq_len: int, device: str) -> bo
         raise
 
 
-def find_max_batch_size(model, tokenizer, seq_len: int = 512, device: str = "cuda") -> int:
-    """Exponential + binary search for the largest fitting batch size."""
+def find_max_batch_size(
+    model,
+    tokenizer,
+    seq_len: int = 512,
+    device: str = "cuda",
+    *,
+    headroom: float = 0.8,
+) -> tuple[int, int]:
     if not _can_run(model, tokenizer, 1, seq_len, device):
         # Avoid low=0 in binary search; real-data path in LR finder retries with smaller batch.
-        return 1
+        return 1, 1
 
     batch = 1
     while _can_run(model, tokenizer, batch, seq_len, device):
@@ -118,8 +124,10 @@ def find_max_batch_size(model, tokenizer, seq_len: int = 512, device: str = "cud
         else:
             high = mid - 1
 
-    # Apply a 0.8 safety factor; DPO needs extra headroom so callers can halve it.
-    return max(1, int(best * 0.8))
+    b_max = max(1, int(best))
+    hr = headroom if 0 < headroom <= 1.0 else 0.8
+    b_train = max(1, int(b_max * hr))
+    return b_max, b_train
 
 
 # --------------------------------------------------------------------------- #
@@ -156,12 +164,15 @@ def _pick_lr_from_smith_curve(
     min_lr: float,
     max_lr: float,
     smith_safety_divisor: float,
+    mode: Literal["steepest", "max_decreasing"] = "steepest",
 ) -> float:
     """
-    Leslie Smith ramp: locate the steepest-loss-drop segment (like fastai ``steep``),
-    then **scale down** for training — the steepest point often sits just before
-    instability, especially for full finetune + small batch. Final LR is
-    ``steepest_lr / smith_safety_divisor``, clamped to ``[min_lr, max_lr]``.
+    Leslie Smith ramp — pick a training LR from the recorded (lr, loss) curve.
+
+    - ``steepest``: most negative ``d(loss)/d(log lr)`` (fastai-style ``steep``).
+    - ``max_decreasing``: largest LR while smoothed loss is still **non-increasing**
+      along the ramp (first sustained rise ends the “stable decreasing” zone), then
+      ``/ smith_safety_divisor`` and clamp to ``[min_lr, max_lr]``.
     """
 
     def _clamp(r: float) -> float:
@@ -196,6 +207,30 @@ def _pick_lr_from_smith_curve(
     smooth = _moving_average_np(loss_f, window=min(5, len(loss_f)))
     if len(smooth) < 2:
         return _clamp(float(lr_f[0]))
+
+    if mode == "max_decreasing":
+        # Relative tolerance: tolerate tiny noise while LR increases.
+        raw_anchor: Optional[float] = None
+        for i in range(1, len(smooth)):
+            if not (np.isfinite(smooth[i]) and np.isfinite(smooth[i - 1])):
+                continue
+            prev = float(smooth[i - 1])
+            tol = 1e-4 * (1.0 + abs(prev))
+            if float(smooth[i]) > prev + tol:
+                raw_anchor = float(lr_f[i - 1])
+                break
+        if raw_anchor is None:
+            raw_anchor = float(lr_f[-1])
+            reason = "smoothed loss still decreasing at highest LR"
+        else:
+            reason = "last LR before first smoothed-loss rise"
+        out = _clamp(raw_anchor / smith_safety_divisor)
+        print(
+            f"  [LR Finder] Smith curve (max_decreasing): anchor {raw_anchor:.2e} "
+            f"({reason}) → training LR {out:.2e} (÷{smith_safety_divisor:g})",
+            flush=True,
+        )
+        return out
 
     log_lr = np.log(lr_f)
     dlog = np.diff(log_lr)
@@ -436,6 +471,7 @@ def _run_smith_with_auto_batch(
     smith_early_stop_divergence: bool = True,
     smith_divergence_vs_min: float = 10.0,
     smith_min_points_before_divergence: int = 5,
+    smith_curve_mode: Literal["steepest", "max_decreasing"] = "steepest",
 ) -> tuple[float, int]:
     trainable_snapshot = {
         name: param.detach().clone()
@@ -450,7 +486,8 @@ def _run_smith_with_auto_batch(
         model.zero_grad(set_to_none=True)
 
     # One causal-LM forward per row (DPO uses ``chosen`` only; not full DPO pairwise loss).
-    start_batch = max(1, safe_batch // 2)
+    # Start at the headroom batch (e.g. 0.8× synthetic max); halve on real-data OOM.
+    start_batch = max(1, safe_batch)
     batch_size = start_batch
 
     while batch_size >= 1:
@@ -477,6 +514,7 @@ def _run_smith_with_auto_batch(
                 min_lr=min_lr,
                 max_lr=max_lr,
                 smith_safety_divisor=smith_safety_divisor,
+                mode=smith_curve_mode,
             )
             return best_lr, batch_size
         except RuntimeError as exc:
@@ -574,7 +612,7 @@ def _run_with_auto_batch(
         model.zero_grad(set_to_none=True)
 
     # Same as Leslie Smith ramp: one forward per row (DPO: ``chosen`` only).
-    start_batch = max(1, safe_batch // 2)
+    start_batch = max(1, safe_batch)
     batch_size = start_batch
 
     while batch_size >= 1:
@@ -612,6 +650,23 @@ def _run_with_auto_batch(
 # --------------------------------------------------------------------------- #
 # Dataset loading — shuffled subset for probing
 # --------------------------------------------------------------------------- #
+
+def _resolve_smith_curve_mode(
+    dataset_type_dict: dict,
+    fallback: Literal["steepest", "max_decreasing"],
+) -> Literal["steepest", "max_decreasing"]:
+    """Normalize mode strings so typos in ``train_info`` cannot silently select the wrong branch."""
+    fb = str(fallback).strip().lower().replace("-", "_")
+    if fb not in ("steepest", "max_decreasing"):
+        fb = "max_decreasing"
+    raw = dataset_type_dict.get("lr_finder_smith_curve_mode")
+    if raw is None:
+        return fb  # type: ignore[return-value]
+    t = str(raw).strip().lower().replace("-", "_")
+    if t in ("steepest", "max_decreasing"):
+        return t  # type: ignore[return-value]
+    return fb  # type: ignore[return-value]
+
 
 def _config_bool_or_default(value, default: bool) -> bool:
     """Parse booleans from JSON/YAML; treat ``None`` as *use default*."""
@@ -701,17 +756,6 @@ def _load_sample_dataset(
     stratify_by_length: bool = True,
     seed: int = 42,
 ) -> tuple[Dataset, str]:
-    """
-    Load the raw JSON dataset, extract the relevant text column, then return
-    a subset sized from dataset row count (fraction with min/max caps), optionally
-    stratified by raw text length, plus the text column name.
-
-    Task columns (all use standard CE loss in the probe, not full DPO/GRPO train loss):
-
-    - ``instruct``: concatenated instruction/input/output → ``text``.
-    - ``dpo``: ``chosen`` only (preference ``rejected`` is ignored in the probe).
-    - ``grpo``: ``prompt`` (or fallback text) → ``text`` (no generations in probe).
-    """
     raw = load_dataset("json", data_files=dataset_path)["train"]
 
     if train_type == "dpo":
@@ -801,6 +845,10 @@ def find_lr(
     lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
+    # Synthetic max batch → B_train = headroom × B_max (default 0.8); training uses
+    # min(B_train, batch that fits on real tokenized batches).
+    batch_headroom: float = 0.8,
+    smith_curve_mode: Literal["steepest", "max_decreasing"] = "max_decreasing",
 ) -> Optional[dict]:
     use_lora = (
         lora_threshold is not None
@@ -832,6 +880,11 @@ def find_lr(
         + (
             f"  smith_micro_batches={_mb}"
             f"  smith_early_stop={smith_early_stop_divergence}"
+            if search_mode == "leslie_smith"
+            else ""
+        )
+        + (
+            f"  smith_curve={_resolve_smith_curve_mode(dataset_type_dict, smith_curve_mode)}"
             if search_mode == "leslie_smith"
             else ""
         ),
@@ -881,11 +934,22 @@ def find_lr(
         model.gradient_checkpointing_enable()
 
         # ------------------------------------------------------------------ #
-        # Find optimal (safe) batch size for this model
+        # Find B_max (synthetic), then B_train = headroom × B_max (default 0.8).
         # ------------------------------------------------------------------ #
-        print("[LR Finder] Probing max batch size …", flush=True)
-        safe_batch = find_max_batch_size(model, tokenizer, seq_len=seq_len, device=device)
-        print(f"[LR Finder] Safe batch size: {safe_batch}", flush=True)
+        _hr = float(
+            dataset_type_dict.get("lr_finder_batch_headroom", batch_headroom)
+        )
+        _hr = _hr if 0 < _hr <= 1.0 else 0.8
+        print("[LR Finder] Probing max batch size (synthetic seq_len) …", flush=True)
+        b_max, b_train = find_max_batch_size(
+            model, tokenizer, seq_len=seq_len, device=device, headroom=_hr
+        )
+        print(
+            f"[LR Finder] B_max={b_max}  B_train={b_train}  (headroom={_hr:g}× for stability)",
+            flush=True,
+        )
+        safe_batch = b_train
+        _curve_mode = _resolve_smith_curve_mode(dataset_type_dict, smith_curve_mode)
 
         # ------------------------------------------------------------------ #
         # Load dataset sample (size from row count; see _load_sample_dataset)
@@ -953,6 +1017,7 @@ def find_lr(
                 smith_early_stop_divergence=smith_early_stop_divergence,
                 smith_divergence_vs_min=smith_divergence_vs_min,
                 smith_min_points_before_divergence=smith_min_points_before_divergence,
+                smith_curve_mode=_curve_mode,
             )
         else:
             lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)
@@ -973,16 +1038,21 @@ def find_lr(
                 optimizer_name=optimizer_name,
             )
 
+        train_batch = min(b_train, probe_batch)
         print(
             f"[LR Finder] Selected LR: {best_lr:.2e}  "
-            f"(micro-train batch_size={probe_batch}; synthetic safe_batch={safe_batch})",
+            f"(probe on real data: batch_size={probe_batch}; "
+            f"B_train={b_train}; training batch_size=min(B_train, probe)={train_batch})",
             flush=True,
         )
         return {
             "lr": best_lr,
-            # Batch size used during the LR sweep — not safe_batch from the synthetic probe,
-            # which can be 2–4× larger and was never validated with real tokenizer + data.
-            "batch_size": probe_batch,
+            # Prefer B_train = headroom×B_max, but never exceed what fit real tokenized batches.
+            "batch_size": train_batch,
+            "b_max_synthetic": b_max,
+            "b_train_synthetic": b_train,
+            "probe_batch_real_data": probe_batch,
+            "smith_curve_mode": _curve_mode,
         }
 
     except Exception as exc:
