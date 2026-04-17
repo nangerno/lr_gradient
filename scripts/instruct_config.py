@@ -159,6 +159,8 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
+        # Largest LR with loss ≤ (1+slack)×L_min (edge of stability; not argmin loss).
+        "lr_finder_peak_rel_slack": float(train_info.get("lr_finder_peak_rel_slack", 0.28)),
     }
 
     if run_lr_finder:

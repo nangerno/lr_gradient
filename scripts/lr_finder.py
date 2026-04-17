@@ -126,15 +126,34 @@ def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
     return [math.exp(log_min + i * step) for i in range(points)]
 
 
-def _pick_lr_largest_near_best_loss(lr_losses: dict[float, float]) -> float:
-    """Prefer the largest LR whose mini-train loss is within tolerance of the best."""
-    finite = {lr: loss for lr, loss in lr_losses.items() if math.isfinite(loss)}
+def _pick_lr_peak_edge_of_stability(
+    lr_losses: dict[float, float],
+    *,
+    rel_slack: float,
+) -> float:
+    finite = [(lr, loss) for lr, loss in lr_losses.items() if math.isfinite(loss)]
     if not finite:
         return min(lr_losses.keys())
-    best_loss = min(finite.values())
-    tol = max(1e-4, 0.02 * abs(best_loss))
-    near_best = [lr for lr, loss in finite.items() if loss <= best_loss + tol]
-    return max(near_best) if near_best else min(finite, key=finite.get)
+    finite.sort(key=lambda x: x[0])
+    min_loss = min(loss for _, loss in finite)
+    if min_loss <= 0:
+        min_loss = max(min_loss, 1e-8)
+    cap = min_loss * (1.0 + rel_slack)
+    acceptable = [lr for lr, loss in finite if loss <= cap]
+    if acceptable:
+        chosen = max(acceptable)
+        print(
+            f"  [LR Finder] peak rule: L_min={min_loss:.4f}  cap=(1+{rel_slack:g})·L_min={cap:.4f}  "
+            f"→ pick largest LR under cap = {chosen:.2e}",
+            flush=True,
+        )
+        return chosen
+    # Pathological: widen once, else minimum-loss LR
+    cap_wide = min_loss * (1.0 + 2.0 * rel_slack)
+    acceptable_w = [lr for lr, loss in finite if loss <= cap_wide]
+    if acceptable_w:
+        return max(acceptable_w)
+    return min(finite, key=lambda x: x[1])[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +240,7 @@ def _run_mini_train_lr_grid(
     optimizer_name: Optional[str],
     *,
     mini_train_batches: int,
+    peak_rel_slack: float,
     collate_fn: Optional[Callable] = None,
 ) -> tuple[float, int]:
     trainable_snapshot = {
@@ -261,7 +281,9 @@ def _run_mini_train_lr_grid(
                 lr_losses[lr] = avg_loss
                 print(f"    mean loss = {avg_loss:.4f}", flush=True)
 
-            best_lr = _pick_lr_largest_near_best_loss(lr_losses)
+            best_lr = _pick_lr_peak_edge_of_stability(
+                lr_losses, rel_slack=peak_rel_slack
+            )
             print(f"  [LR Finder] selected LR from mini-train grid: {best_lr:.2e}", flush=True)
             return best_lr, batch_size
         except RuntimeError as exc:
@@ -448,21 +470,8 @@ def find_lr(
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
     grpo_slow_reward_proxy_probe: bool = False,
+    peak_rel_slack: float = 0.28,
 ) -> Optional[dict]:
-    """
-    Pick LR by **mini-training** each log-spaced candidate on **2%** of the tokenized
-    instruct dataset (``train_tokenized_*.json``). Batch size starts at the synthetic
-    safety probe (headroom × max batch), then halves on OOM until real batches fit.
-
-    Mini-train always optimizes **causal LM cross-entropy (SFT-style)** on padded
-    ``labels`` — never GRPO reward functions or rollouts. For GRPO jobs with slow
-    rewards, pass ``grpo_slow_reward_proxy_probe=True`` so logs state explicitly
-    that expensive rewards are not used in this phase.
-
-    Intended order (callers): **tokenize** → **safe batch** (``find_max_batch_size``
-    then ``safe_batch``) → **LR grid** on 2% tokenized data at ``batch ≤ safe_batch``
-    → set ``batch_size`` / ``lr`` on the real training run.
-    """
     if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         print(
             "[LR Finder] tokenized_dataset_path missing or not a file; need train_tokenized JSON.",
@@ -483,6 +492,8 @@ def find_lr(
         1,
         int(dataset_type_dict.get("lr_finder_mini_train_batches", mini_train_batches)),
     )
+    _peak_sl = float(dataset_type_dict.get("lr_finder_peak_rel_slack", peak_rel_slack))
+    _peak_sl = max(0.0, min(3.0, _peak_sl))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     _proxy_grpo = bool(
@@ -498,7 +509,8 @@ def find_lr(
         f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
         + f"  optim={_opt_disp}  probe=2%_tokenized  lr_probe_points={_points}"
-        + f"  mini_train_batches={_mini_b}",
+        + f"  mini_train_batches={_mini_b}"
+        + f"  peak_rel_slack={_peak_sl:g}",
         flush=True,
     )
     if _proxy_grpo:
@@ -607,6 +619,7 @@ def find_lr(
             device,
             optimizer_name=optimizer_name,
             mini_train_batches=_mini_b,
+            peak_rel_slack=_peak_sl,
             collate_fn=collate_fn,
         )
 

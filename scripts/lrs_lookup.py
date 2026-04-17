@@ -43,6 +43,10 @@ def apply_tokenized_lr_finder_to_run_config(
     if tokenized_train_path:
         dataset_type_dict["tokenized_train_path"] = tokenized_train_path
 
+    dataset_type_dict["lr_finder_peak_rel_slack"] = float(
+        run_config.get("lr_finder_peak_rel_slack", 0.28)
+    )
+
     if not is_instruct_lr_finder_runnable(tokenized_train_path):
         print(
             "[LR Finder] Skipping: no train_tokenized JSON; using param-based LR and batch.",
