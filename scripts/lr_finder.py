@@ -201,7 +201,8 @@ def _mini_train_mean_loss(
         inputs = {k: v.to(device) for k, v in batch.items()}
         optimizer.zero_grad()
         with _bf16_autocast(device):
-            loss = model(**inputs, labels=inputs["labels"]).loss
+            # Batch already includes ``labels``; do not pass ``labels=`` again (TypeError).
+            loss = model(**inputs).loss
         if not torch.isfinite(loss):
             return float("inf")
         loss.backward()
