@@ -1,11 +1,91 @@
 import os
-from typing import Literal, Optional
+from typing import Optional
 
 from lr_finder import find_lr
 
-SmithCurveMode = Literal["steepest", "max_decreasing"]
 
-_DPO_GRPO_LORA_THRESHOLD = 2_000_000_000
+def resolve_tokenized_train_path(train_info: dict) -> Optional[str]:
+    """Resolve ``train_tokenized_*.json``: explicit path, or ``datasets/train_tokenized_{task_id}.json``."""
+    tokenized_train_path = train_info.get("tokenized_train_path")
+    if not tokenized_train_path and train_info.get("task_id"):
+        candidate = f"datasets/train_tokenized_{train_info['task_id']}.json"
+        tokenized_train_path = candidate if os.path.isfile(candidate) else None
+    elif tokenized_train_path and not os.path.isfile(tokenized_train_path):
+        tokenized_train_path = None
+    return tokenized_train_path or None
+
+
+def apply_tokenized_lr_finder_to_run_config(
+    run_config: dict,
+    train_info: dict,
+    model_id: str,
+    model_path: str,
+    num_params: Optional[int],
+    *,
+    fallback_learning_rate: float,
+    grpo_slow_reward_proxy_probe: bool = False,
+) -> None:
+    """
+    When a tokenized instruct JSON exists, run the mini-train probe and set
+    ``learning_rate`` and ``batch_size`` on ``run_config``.
+
+    Expects ``run_config`` to include ``lr_finder_*`` keys (same as ``instruct_config``).
+
+    For GRPO jobs that use slow/heavy reward functions, pass
+    ``grpo_slow_reward_proxy_probe=True``: the probe still uses **SFT CE only**
+    (never reward models); full training afterward uses real rewards.
+    """
+    dataset_type_dict = dict(train_info.get("dataset_type", {}))
+    tokenized_train_path = resolve_tokenized_train_path(train_info)
+    if tokenized_train_path:
+        dataset_type_dict["tokenized_train_path"] = tokenized_train_path
+
+    if not is_instruct_lr_finder_runnable(tokenized_train_path):
+        print(
+            "[LR Finder] Skipping: no train_tokenized JSON; using param-based LR and batch.",
+            flush=True,
+        )
+        return
+
+    lr_result = get_instruct_lr(
+        model_id,
+        model_path,
+        num_params,
+        dataset_type_dict,
+        tokenized_dataset_path=tokenized_train_path,
+        seq_len=run_config["lr_finder_seq_len"],
+        lr_probe_points=run_config["lr_finder_lr_probe_points"],
+        mini_train_batches=run_config["lr_finder_mini_train_batches"],
+        optimizer_name=run_config["optimizer"],
+        lr_sample_stratify=run_config["lr_finder_stratify_length"],
+        lr_sample_seed=run_config["lr_finder_sample_seed"],
+        batch_headroom=run_config["lr_finder_batch_headroom"],
+        grpo_slow_reward_proxy_probe=grpo_slow_reward_proxy_probe,
+    )
+
+    if lr_result is not None:
+        lr = lr_result.get("lr")
+        bs = lr_result.get("batch_size")
+
+        if lr is not None:
+            print(f"Using lr from finder (2% tokenized probe): {lr}", flush=True)
+            run_config["learning_rate"] = lr
+        else:
+            print(
+                f"LR finder returned no lr; using param-based fallback: {fallback_learning_rate}",
+                flush=True,
+            )
+            run_config["learning_rate"] = fallback_learning_rate
+
+        if bs is not None:
+            print(f"Using batch size from finder (safety batch): {bs}", flush=True)
+            run_config["batch_size"] = bs
+    else:
+        print(
+            "[LR Finder] Probe failed; using param-based learning rate: "
+            f"{run_config['learning_rate']}",
+            flush=True,
+        )
 
 
 def is_dataset_available_for_lr_finder(dataset_path: Optional[str]) -> bool:
@@ -13,289 +93,43 @@ def is_dataset_available_for_lr_finder(dataset_path: Optional[str]) -> bool:
     return bool(dataset_path and str(dataset_path).strip())
 
 
-def is_instruct_lr_finder_runnable(
-    dataset_path: Optional[str],
-    tokenized_train_path: Optional[str],
-) -> bool:
-    """True if we have raw JSON and/or an on-disk tokenized train file for the instruct probe."""
-    if dataset_path and str(dataset_path).strip():
-        return True
+def is_instruct_lr_finder_runnable(tokenized_train_path: Optional[str]) -> bool:
+    """LR finder runs only on ``train_tokenized_*.json`` (2% sample + safety batch)."""
     return bool(tokenized_train_path and os.path.isfile(tokenized_train_path))
-
-
-def is_dpo_grpo_lr_finder_runnable(
-    dataset_path: Optional[str],
-    training_split_path: Optional[str],
-) -> bool:
-    """True if we have the original dataset path and/or the per-task DPO/GRPO train JSON on disk."""
-    if dataset_path and str(dataset_path).strip():
-        return True
-    return bool(training_split_path and os.path.isfile(training_split_path))
-
-
-_DPO_GRPO_LORA_R = 128
-_DPO_GRPO_LORA_ALPHA     = 256
-_DPO_GRPO_LORA_DROPOUT   = 0.05
-
-_GRPO_PROBE_SEQ_CAP = 8192
-
-
-def _grpo_probe_seq_len(max_prompt_length: int, max_completion_length: int) -> int:
-    """Upper-bound token length for LR probe (aligns batch + micro-train with GRPO training)."""
-    total = max(1, int(max_prompt_length) + int(max_completion_length))
-    return min(total, _GRPO_PROBE_SEQ_CAP)
 
 
 def get_instruct_lr(
     model_id: str,
     model_path: str,
     num_params: Optional[int],
-    dataset_path: str,
     dataset_type_dict: dict,
     *,
+    tokenized_dataset_path: str,
     seq_len: int = 1024,
-    steps: int = 40,
-    lr_points: int = 35,
+    lr_probe_points: int = 28,
+    mini_train_batches: int = 3,
     optimizer_name: Optional[str] = None,
-    smith_safety_divisor: Optional[float] = None,
-    smith_micro_batches: int = 1,
-    smith_early_stop_divergence: bool = True,
-    smith_divergence_vs_min: float = 10.0,
-    smith_min_points_before_divergence: int = 5,
-    lr_sample_frac: float = 0.02,
-    lr_sample_min: int = 200,
-    lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
-    smith_curve_mode: SmithCurveMode = "max_decreasing",
-    tokenized_dataset_path: Optional[str] = None,
-    lr_finder_use_full_tokenized_dataset: bool = False,
-    lr_finder_tokenized_full_cap: int = 10_000,
+    grpo_slow_reward_proxy_probe: bool = False,
 ) -> Optional[dict]:
-    has_raw = bool(dataset_path and str(dataset_path).strip())
-    has_tok = bool(tokenized_dataset_path and os.path.isfile(tokenized_dataset_path))
-    if not has_raw and not has_tok:
+    if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         return None
     return find_lr(
-        model_id, model_path, num_params,
-        dataset_path or "",
+        model_id,
+        model_path,
+        num_params,
+        tokenized_dataset_path,
         dataset_type_dict,
-        train_type="instruct",
         min_lr=1e-6,
         max_lr=9e-3,
+        lr_probe_points=lr_probe_points,
+        mini_train_batches=mini_train_batches,
         seq_len=seq_len,
-        steps=steps,
-        lr_points=lr_points,
         optimizer_name=optimizer_name,
-        lora_threshold=None,
-        smith_safety_divisor=smith_safety_divisor,
-        smith_micro_batches=smith_micro_batches,
-        smith_early_stop_divergence=smith_early_stop_divergence,
-        smith_divergence_vs_min=smith_divergence_vs_min,
-        smith_min_points_before_divergence=smith_min_points_before_divergence,
-        lr_sample_frac=lr_sample_frac,
-        lr_sample_min=lr_sample_min,
-        lr_sample_max=lr_sample_max,
         lr_sample_stratify=lr_sample_stratify,
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
-        smith_curve_mode=smith_curve_mode,
-        tokenized_dataset_path=tokenized_dataset_path,
-        lr_finder_use_full_tokenized_dataset=lr_finder_use_full_tokenized_dataset,
-        lr_finder_tokenized_full_cap=lr_finder_tokenized_full_cap,
-    )
-
-
-def get_dpo_lr(
-    model_id: str,
-    model_path: str,
-    num_params: Optional[int],
-    dataset_path: str,
-    dataset_type_dict: dict,
-    *,
-    seq_len: int = 512,
-    steps: int = 40,
-    lr_points: int = 35,
-    optimizer_name: Optional[str] = None,
-    smith_safety_divisor: Optional[float] = None,
-    smith_micro_batches: int = 1,
-    smith_early_stop_divergence: bool = True,
-    smith_divergence_vs_min: float = 10.0,
-    smith_min_points_before_divergence: int = 5,
-    lr_sample_frac: float = 0.02,
-    lr_sample_min: int = 200,
-    lr_sample_max: int = 3000,
-    lr_sample_stratify: bool = True,
-    lr_sample_seed: int = 42,
-    batch_headroom: float = 0.8,
-    smith_curve_mode: SmithCurveMode = "max_decreasing",
-    tokenized_dataset_path: Optional[str] = None,
-) -> Optional[dict]:
-    if not (dataset_path and str(dataset_path).strip()) and not (
-        tokenized_dataset_path and os.path.isfile(tokenized_dataset_path)
-    ):
-        return None
-    return find_lr(
-        model_id, model_path, num_params,
-        dataset_path or "",
-        dataset_type_dict,
-        train_type="dpo",
-        min_lr=1e-7,
-        max_lr=9e-4,
-        seq_len=seq_len,
-        steps=steps,
-        lr_points=lr_points,
-        optimizer_name=optimizer_name,
-        lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
-        lora_r=_DPO_GRPO_LORA_R,
-        lora_alpha=_DPO_GRPO_LORA_ALPHA,
-        lora_dropout=_DPO_GRPO_LORA_DROPOUT,
-        smith_safety_divisor=smith_safety_divisor,
-        smith_micro_batches=smith_micro_batches,
-        smith_early_stop_divergence=smith_early_stop_divergence,
-        smith_divergence_vs_min=smith_divergence_vs_min,
-        smith_min_points_before_divergence=smith_min_points_before_divergence,
-        lr_sample_frac=lr_sample_frac,
-        lr_sample_min=lr_sample_min,
-        lr_sample_max=lr_sample_max,
-        lr_sample_stratify=lr_sample_stratify,
-        lr_sample_seed=lr_sample_seed,
-        batch_headroom=batch_headroom,
-        smith_curve_mode=smith_curve_mode,
-        tokenized_dataset_path=tokenized_dataset_path,
-    )
-
-
-def get_grpo_lr(
-    model_id: str,
-    model_path: str,
-    num_params: Optional[int],
-    dataset_path: str,
-    dataset_type_dict: dict,
-    *,
-    max_prompt_length: int = 512,
-    max_completion_length: int = 512,
-    steps: int = 40,
-    lr_points: int = 35,
-    optimizer_name: Optional[str] = None,
-    smith_safety_divisor: Optional[float] = None,
-    smith_micro_batches: int = 1,
-    smith_early_stop_divergence: bool = True,
-    smith_divergence_vs_min: float = 10.0,
-    smith_min_points_before_divergence: int = 5,
-    lr_sample_frac: float = 0.02,
-    lr_sample_min: int = 200,
-    lr_sample_max: int = 3000,
-    lr_sample_stratify: bool = True,
-    lr_sample_seed: int = 42,
-    batch_headroom: float = 0.8,
-    smith_curve_mode: SmithCurveMode = "max_decreasing",
-    tokenized_dataset_path: Optional[str] = None,
-) -> Optional[dict]:
-    if not (dataset_path and str(dataset_path).strip()) and not (
-        tokenized_dataset_path and os.path.isfile(tokenized_dataset_path)
-    ):
-        return None
-    seq_len = _grpo_probe_seq_len(max_prompt_length, max_completion_length)
-    print(
-        f"[LR Finder] GRPO probe seq_len={seq_len} "
-        f"(max_prompt={max_prompt_length} + max_completion={max_completion_length})",
-        flush=True,
-    )
-    return find_lr(
-        model_id, model_path, num_params,
-        dataset_path or "",
-        dataset_type_dict,
-        train_type="grpo",
-        min_lr=1e-5,
-        max_lr=9e-4,
-        seq_len=seq_len,
-        steps=steps,
-        lr_points=lr_points,
-        optimizer_name=optimizer_name,
-        lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
-        lora_r=_DPO_GRPO_LORA_R,
-        lora_alpha=_DPO_GRPO_LORA_ALPHA,
-        lora_dropout=_DPO_GRPO_LORA_DROPOUT,
-        smith_safety_divisor=smith_safety_divisor,
-        smith_micro_batches=smith_micro_batches,
-        smith_early_stop_divergence=smith_early_stop_divergence,
-        smith_divergence_vs_min=smith_divergence_vs_min,
-        smith_min_points_before_divergence=smith_min_points_before_divergence,
-        lr_sample_frac=lr_sample_frac,
-        lr_sample_min=lr_sample_min,
-        lr_sample_max=lr_sample_max,
-        lr_sample_stratify=lr_sample_stratify,
-        lr_sample_seed=lr_sample_seed,
-        batch_headroom=batch_headroom,
-        smith_curve_mode=smith_curve_mode,
-        tokenized_dataset_path=tokenized_dataset_path,
-    )
-
-
-def get_grpo_python_lr(
-    model_id: str,
-    model_path: str,
-    num_params: Optional[int],
-    dataset_path: str,
-    dataset_type_dict: dict,
-    *,
-    max_prompt_length: int = 512,
-    max_completion_length: int = 512,
-    steps: int = 40,
-    lr_points: int = 30,
-    optimizer_name: Optional[str] = None,
-    smith_safety_divisor: Optional[float] = None,
-    smith_micro_batches: int = 1,
-    smith_early_stop_divergence: bool = True,
-    smith_divergence_vs_min: float = 10.0,
-    smith_min_points_before_divergence: int = 5,
-    lr_sample_frac: float = 0.02,
-    lr_sample_min: int = 200,
-    lr_sample_max: int = 3000,
-    lr_sample_stratify: bool = True,
-    lr_sample_seed: int = 42,
-    batch_headroom: float = 0.8,
-    smith_curve_mode: SmithCurveMode = "max_decreasing",
-    tokenized_dataset_path: Optional[str] = None,
-) -> Optional[dict]:
-    if not (dataset_path and str(dataset_path).strip()) and not (
-        tokenized_dataset_path and os.path.isfile(tokenized_dataset_path)
-    ):
-        return None
-    seq_len = _grpo_probe_seq_len(max_prompt_length, max_completion_length)
-    print(
-        f"[LR Finder] GRPO probe seq_len={seq_len} "
-        f"(max_prompt={max_prompt_length} + max_completion={max_completion_length})",
-        flush=True,
-    )
-    return find_lr(
-        model_id, model_path, num_params,
-        dataset_path or "",
-        dataset_type_dict,
-        train_type="grpo",
-        min_lr=1e-6,
-        max_lr=9e-3,
-        seq_len=seq_len,
-        steps=steps,
-        lr_points=lr_points,
-        optimizer_name=optimizer_name,
-        lora_threshold=_DPO_GRPO_LORA_THRESHOLD,
-        lora_r=_DPO_GRPO_LORA_R,
-        lora_alpha=_DPO_GRPO_LORA_ALPHA,
-        lora_dropout=_DPO_GRPO_LORA_DROPOUT,
-        smith_safety_divisor=smith_safety_divisor,
-        smith_micro_batches=smith_micro_batches,
-        smith_early_stop_divergence=smith_early_stop_divergence,
-        smith_divergence_vs_min=smith_divergence_vs_min,
-        smith_min_points_before_divergence=smith_min_points_before_divergence,
-        lr_sample_frac=lr_sample_frac,
-        lr_sample_min=lr_sample_min,
-        lr_sample_max=lr_sample_max,
-        lr_sample_stratify=lr_sample_stratify,
-        lr_sample_seed=lr_sample_seed,
-        batch_headroom=batch_headroom,
-        smith_curve_mode=smith_curve_mode,
-        tokenized_dataset_path=tokenized_dataset_path,
+        grpo_slow_reward_proxy_probe=grpo_slow_reward_proxy_probe,
     )

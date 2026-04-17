@@ -3,11 +3,11 @@ import json
 import math
 import os
 import random
-from typing import Callable, Literal, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -28,36 +28,6 @@ _DEFAULT_LORA_THRESHOLD = 4_000_000_000
 _DEFAULT_LORA_R = 8
 _DEFAULT_LORA_ALPHA = 16
 _DEFAULT_LORA_DROPOUT = 0.05
-
-# --------------------------------------------------------------------------- #
-# Text extraction helpers
-# --------------------------------------------------------------------------- #
-
-def example_to_text(example: dict, mapping: Optional[dict] = None) -> str:
-    mapping = mapping or {}
-    inst_key = mapping.get("field_instruction", "instruction")
-    input_key = mapping.get("field_input", "input")
-    output_key = mapping.get("field_output", "output")
-
-    parts = []
-    for key in (inst_key, input_key, output_key):
-        value = example.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value.strip())
-    if parts:
-        return "\n".join(parts)
-
-    for key in ("text", "content", "prompt", "question"):
-        value = example.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    for value in example.values():
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    return json.dumps(example, ensure_ascii=True)
-
 
 # --------------------------------------------------------------------------- #
 # LoRA helpers
@@ -156,133 +126,15 @@ def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
     return [math.exp(log_min + i * step) for i in range(points)]
 
 
-def _moving_average_np(x: np.ndarray, window: int) -> np.ndarray:
-    """Moving average with `mode=same` length; no-op when `window <= 1`."""
-    x = np.asarray(x, dtype=np.float64)
-    if window <= 1 or len(x) < 2:
-        return x
-    w = min(window, len(x))
-    kernel = np.ones(w, dtype=np.float64) / float(w)
-    return np.convolve(x, kernel, mode="same")
-
-
-def _pick_lr_from_smith_curve(
-    lrs: list[float],
-    losses: list[float],
-    *,
-    min_lr: float,
-    max_lr: float,
-    smith_safety_divisor: float,
-    mode: Literal["steepest", "max_decreasing"] = "steepest",
-) -> float:
-    """
-    Leslie Smith ramp — pick a training LR from the recorded (lr, loss) curve.
-
-    - ``steepest``: most negative ``d(loss)/d(log lr)`` (fastai-style ``steep``).
-    - ``max_decreasing``: largest LR while smoothed loss is still **non-increasing**
-      along the ramp (first sustained rise ends the “stable decreasing” zone), then
-      ``/ smith_safety_divisor`` and clamp to ``[min_lr, max_lr]``.
-    """
-
-    def _clamp(r: float) -> float:
-        return float(max(min_lr, min(r, max_lr)))
-
-    lr_arr = np.array(lrs, dtype=np.float64)
-    loss_arr = np.array(losses, dtype=np.float64)
-    finite = np.isfinite(loss_arr) & np.isfinite(lr_arr) & (lr_arr > 0)
-    if not finite.any():
-        return _clamp(float(lr_arr[0]) if len(lr_arr) else 1e-6)
-
-    lr_f = lr_arr[finite]
-    loss_f = loss_arr[finite]
-    # Match fastai Learner.lr_find: drop noisy start and divergent tail before suggesting.
-    _trim_lo = len(lr_f) // 10
-    _trim_hi = 5
-    if len(lr_f) > _trim_lo + _trim_hi + 4:
-        lr_f = lr_f[_trim_lo : len(lr_f) - _trim_hi]
-        loss_f = loss_f[_trim_lo : len(loss_f) - _trim_hi]
-
-    if len(lr_f) < 3:
-        j = int(np.nanargmin(loss_f))
-        raw = float(lr_f[j])
-        out = _clamp(raw / smith_safety_divisor)
-        print(
-            f"  [LR Finder] Smith curve: short ramp — min-loss anchor {raw:.2e} → "
-            f"LR {out:.2e} (÷{smith_safety_divisor:g})",
-            flush=True,
-        )
-        return out
-
-    smooth = _moving_average_np(loss_f, window=min(5, len(loss_f)))
-    if len(smooth) < 2:
-        return _clamp(float(lr_f[0]))
-
-    if mode == "max_decreasing":
-        # Relative tolerance: tolerate tiny noise while LR increases.
-        # Require a short *streak* of rises so one noisy point does not end the zone.
-        rise_patience = 2
-        rise_streak = 0
-        rise_start_idx = -1
-        raw_anchor: Optional[float] = None
-        for i in range(1, len(smooth)):
-            if not (np.isfinite(smooth[i]) and np.isfinite(smooth[i - 1])):
-                continue
-            prev = float(smooth[i - 1])
-            tol = 1e-4 * (1.0 + abs(prev))
-            if float(smooth[i]) > prev + tol:
-                if rise_streak == 0:
-                    rise_start_idx = i
-                rise_streak += 1
-                if rise_streak >= rise_patience:
-                    # Anchor at the last LR before the sustained rise starts.
-                    raw_anchor = float(lr_f[max(0, rise_start_idx - 1)])
-                    break
-            else:
-                rise_streak = 0
-                rise_start_idx = -1
-        if raw_anchor is None:
-            raw_anchor = float(lr_f[-1])
-            reason = "smoothed loss still decreasing at highest LR"
-        else:
-            reason = "last LR before sustained smoothed-loss rise"
-        out = _clamp(raw_anchor / smith_safety_divisor)
-        print(
-            f"  [LR Finder] Smith curve (max_decreasing): anchor {raw_anchor:.2e} "
-            f"({reason}) → training LR {out:.2e} (÷{smith_safety_divisor:g})",
-            flush=True,
-        )
-        return out
-
-    log_lr = np.log(lr_f)
-    dlog = np.diff(log_lr)
-    dloss = np.diff(smooth)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        slope = np.where(dlog != 0, dloss / dlog, np.nan)
-
-    valid = np.isfinite(slope)
-    if not valid.any():
-        return _clamp(float(lr_f[0]))
-
-    masked = np.where(valid, slope, np.nan)
-    if np.nanmin(masked) >= 0:
-        print(
-            "  [LR Finder] Smith curve: loss never decreases along ramp; "
-            f"using min LR {lr_f[0]:.2e}",
-            flush=True,
-        )
-        return _clamp(float(lr_f[0]))
-
-    # Steepest descent: most negative slope (loss drops fastest as LR increases).
-    # Index j is the left edge of that segment (same convention as fastai ``steep``).
-    j = int(np.nanargmin(masked))
-    raw_steep = float(lr_f[j])
-    out = _clamp(raw_steep / smith_safety_divisor)
-    print(
-        f"  [LR Finder] Smith curve: steepest ~{raw_steep:.2e} → training LR {out:.2e} "
-        f"(÷{smith_safety_divisor:g})",
-        flush=True,
-    )
-    return out
+def _pick_lr_largest_near_best_loss(lr_losses: dict[float, float]) -> float:
+    """Prefer the largest LR whose mini-train loss is within tolerance of the best."""
+    finite = {lr: loss for lr, loss in lr_losses.items() if math.isfinite(loss)}
+    if not finite:
+        return min(lr_losses.keys())
+    best_loss = min(finite.values())
+    tol = max(1e-4, 0.02 * abs(best_loss))
+    near_best = [lr for lr, loss in finite.items() if loss <= best_loss + tol]
+    return max(near_best) if near_best else min(finite, key=finite.get)
 
 
 # --------------------------------------------------------------------------- #
@@ -321,64 +173,6 @@ def _make_optimizer(
     return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
-def _micro_train(
-    model,
-    tokenizer,
-    dataloader,
-    lr: float,
-    text_key: str,
-    steps: int,
-    device: str,
-    seq_len: int = 512,
-    optimizer_name: Optional[str] = None,
-) -> float:
-    """Generic causal-LM micro-training used for instruct, grpo, and dpo."""
-    optimizer = _make_optimizer(model, lr, optimizer_name)
-    trainable = _trainable_params(model)
-    model.train()
-    losses: list[float] = []
-    batch_iter = _iter_batches_forever(dataloader)
-
-    for _ in range(max(1, int(steps))):
-        try:
-            batch = next(batch_iter)
-        except StopIteration:
-            # Empty dataloader: caller should handle this as unusable LR.
-            break
-        optimizer.zero_grad()
-
-        if text_key == TOKENIZED_BATCH_KEY:
-            inputs = {k: v.to(device) for k, v in batch.items()}
-        else:
-            texts = batch[text_key]
-            # Truncate to seq_len so memory usage matches the find_max_batch_size probe.
-            inputs = tokenizer(
-                texts, return_tensors="pt", truncation=True, padding=True,
-                max_length=seq_len,
-            ).to(device)
-
-        with _bf16_autocast(device):
-            if text_key == TOKENIZED_BATCH_KEY:
-                outputs = model(**inputs, labels=inputs["labels"])
-            else:
-                outputs = model(**inputs, labels=inputs["input_ids"])
-            loss = outputs.loss
-
-        if not torch.isfinite(loss):
-            continue
-
-        losses.append(loss.item())
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-        optimizer.step()
-
-        # Early-stop if loss diverges sharply
-        if len(losses) > 5 and loss.item() > 3 * min(losses):
-            break
-
-    return float(np.mean(losses)) if losses else float("inf")
-
-
 def _iter_batches_forever(dataloader):
     if len(dataloader) == 0:
         return
@@ -387,129 +181,45 @@ def _iter_batches_forever(dataloader):
             yield batch
 
 
-def _micro_train_leslie_smith(
+def _mini_train_mean_loss(
     model,
-    tokenizer,
     dataloader,
-    lr_schedule: list[float],
-    text_key: str,
+    lr: float,
     device: str,
-    seq_len: int,
     optimizer_name: Optional[str],
     *,
-    micro_batches_per_lr: int = 1,
-    early_stop_on_divergence: bool = True,
-    divergence_vs_min_loss: float = 10.0,
-    min_points_before_divergence_check: int = 5,
-) -> tuple[list[float], list[float]]:
-    """
-    Single continuous run with exponentially increasing LR each step (Leslie Smith).
-
-    ``micro_batches_per_lr``: gradient accumulation — averages gradient over this many
-    batches per LR point for a less noisy loss curve (linear time cost).
-
-    ``early_stop_on_divergence``: stop the ramp when loss spikes vs the running minimum
-    (saves time once the useful LR range has been passed).
-    """
-    if not lr_schedule:
-        return [], []
-
-    mb = max(1, int(micro_batches_per_lr))
-    optimizer = _make_optimizer(model, lr_schedule[0], optimizer_name)
+    num_batches: int,
+) -> float:
+    """Run ``num_batches`` optimizer steps at ``lr``; return mean loss (tokenized batches only)."""
+    optimizer = _make_optimizer(model, lr, optimizer_name)
     trainable = _trainable_params(model)
     model.train()
-    lrs_recorded: list[float] = []
-    losses_recorded: list[float] = []
+    losses: list[float] = []
     batch_iter = _iter_batches_forever(dataloader)
-
-    for step in range(len(lr_schedule)):
-        lr = lr_schedule[step]
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-
+    for _ in range(max(1, int(num_batches))):
+        batch = next(batch_iter)
+        inputs = {k: v.to(device) for k, v in batch.items()}
         optimizer.zero_grad()
-        batch_losses: list[float] = []
-
-        for _ in range(mb):
-            batch = next(batch_iter)
-            if text_key == TOKENIZED_BATCH_KEY:
-                inputs = {k: v.to(device) for k, v in batch.items()}
-            else:
-                texts = batch[text_key]
-                inputs = tokenizer(
-                    texts,
-                    return_tensors="pt",
-                    truncation=True,
-                    padding=True,
-                    max_length=seq_len,
-                ).to(device)
-
-            with _bf16_autocast(device):
-                if text_key == TOKENIZED_BATCH_KEY:
-                    outputs = model(**inputs, labels=inputs["labels"])
-                else:
-                    outputs = model(**inputs, labels=inputs["input_ids"])
-                loss = outputs.loss
-
-            if not torch.isfinite(loss):
-                lrs_recorded.append(lr)
-                losses_recorded.append(float("nan"))
-                print(
-                    "  [LR Finder] Smith ramp: non-finite loss; stopping curve early.",
-                    flush=True,
-                )
-                return lrs_recorded, losses_recorded
-
-            batch_losses.append(loss.item())
-            (loss / mb).backward()
-
-        mean_loss = float(np.mean(batch_losses))
-
-        if (
-            early_stop_on_divergence
-            and len(losses_recorded) >= min_points_before_divergence_check
-            and losses_recorded
-        ):
-            running_min = min(losses_recorded)
-            if math.isfinite(running_min) and running_min > 0:
-                if mean_loss > divergence_vs_min_loss * running_min:
-                    lrs_recorded.append(lr)
-                    losses_recorded.append(mean_loss)
-                    optimizer.zero_grad(set_to_none=True)
-                    print(
-                        "  [LR Finder] Smith ramp: early stop — loss spiked vs minimum "
-                        f"(lr={lr:.2e}, loss={mean_loss:.4f}); saving wall time.",
-                        flush=True,
-                    )
-                    break
-
-        lrs_recorded.append(lr)
-        losses_recorded.append(mean_loss)
+        with _bf16_autocast(device):
+            loss = model(**inputs, labels=inputs["labels"]).loss
+        if not torch.isfinite(loss):
+            return float("inf")
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
         optimizer.step()
+        losses.append(loss.item())
+    return float(np.mean(losses)) if losses else float("inf")
 
-    return lrs_recorded, losses_recorded
 
-
-def _run_smith_with_auto_batch(
+def _run_mini_train_lr_grid(
     model,
-    tokenizer,
     dataset: Dataset,
     safe_batch: int,
-    lr_schedule: list[float],
-    text_key: str,
+    lr_candidates: list[float],
     device: str,
-    seq_len: int = 512,
-    optimizer_name: Optional[str] = None,
+    optimizer_name: Optional[str],
     *,
-    min_lr: float,
-    max_lr: float,
-    smith_safety_divisor: float,
-    smith_micro_batches: int = 1,
-    smith_early_stop_divergence: bool = True,
-    smith_divergence_vs_min: float = 10.0,
-    smith_min_points_before_divergence: int = 5,
-    smith_curve_mode: Literal["steepest", "max_decreasing"] = "steepest",
+    mini_train_batches: int,
     collate_fn: Optional[Callable] = None,
 ) -> tuple[float, int]:
     trainable_snapshot = {
@@ -524,191 +234,34 @@ def _run_smith_with_auto_batch(
                 param.data.copy_(trainable_snapshot[name])
         model.zero_grad(set_to_none=True)
 
-    # One causal-LM forward per row (DPO uses ``chosen`` only; not full DPO pairwise loss).
-    # Start at the headroom batch (e.g. 0.8× synthetic max); halve on real-data OOM.
     start_batch = max(1, safe_batch)
     batch_size = start_batch
 
     while batch_size >= 1:
         try:
-            _restore_trainable_weights()
+            lr_losses: dict[float, float] = {}
             dl = DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
             )
-            lrs_out, losses_out = _micro_train_leslie_smith(
-                model,
-                tokenizer,
-                dl,
-                lr_schedule,
-                text_key,
-                device,
-                seq_len,
-                optimizer_name,
-                micro_batches_per_lr=smith_micro_batches,
-                early_stop_on_divergence=smith_early_stop_divergence,
-                divergence_vs_min_loss=smith_divergence_vs_min,
-                min_points_before_divergence_check=smith_min_points_before_divergence,
-            )
-            best_lr = _pick_lr_from_smith_curve(
-                lrs_out,
-                losses_out,
-                min_lr=min_lr,
-                max_lr=max_lr,
-                smith_safety_divisor=smith_safety_divisor,
-                mode=smith_curve_mode,
-            )
-            # If max_decreasing clamps to min_lr, steepest descent often sits higher — use it as fallback.
-            if (
-                smith_curve_mode == "max_decreasing"
-                and lrs_out
-                and math.isclose(best_lr, min_lr, rel_tol=0.0, abs_tol=max(min_lr * 1e-9, 1e-15))
-            ):
-                steepest_lr = _pick_lr_from_smith_curve(
-                    lrs_out,
-                    losses_out,
-                    min_lr=min_lr,
-                    max_lr=max_lr,
-                    smith_safety_divisor=smith_safety_divisor,
-                    mode="steepest",
+            for lr in lr_candidates:
+                _restore_trainable_weights()
+                print(f"  [LR Finder] mini-train probe LR={lr:.2e} …", flush=True)
+                avg_loss = _mini_train_mean_loss(
+                    model,
+                    dl,
+                    lr,
+                    device,
+                    optimizer_name,
+                    num_batches=mini_train_batches,
                 )
-                if steepest_lr > best_lr + max(min_lr * 1e-9, 1e-15):
-                    print(
-                        f"  [LR Finder] Primary mode hit min_lr; steepest-curve fallback "
-                        f"{steepest_lr:.2e} (was {best_lr:.2e})",
-                        flush=True,
-                    )
-                    best_lr = steepest_lr
-            return best_lr, batch_size
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower():
-                print(
-                    f"  [LR Finder] OOM at batch_size={batch_size}, halving …",
-                    flush=True,
-                )
-                batch_size //= 2
-                torch.cuda.empty_cache()
-            else:
-                raise
+                lr_losses[lr] = avg_loss
+                print(f"    mean loss = {avg_loss:.4f}", flush=True)
 
-    raise RuntimeError("Even batch_size=1 does not fit in GPU memory.")
-
-
-def _pick_best_lr(
-    model,
-    tokenizer,
-    dataloader,
-    lr_candidates: list[float],
-    text_key: str,
-    steps: int,
-    device: str,
-    seq_len: int = 512,
-    optimizer_name: Optional[str] = None,
-) -> float:
-    # Reset trainable weights before each LR so probes do not compound on prior steps.
-    trainable_snapshot = {
-        name: param.detach().clone()
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    }
-
-    def _restore_trainable_weights() -> None:
-        for name, param in model.named_parameters():
-            if name in trainable_snapshot:
-                param.data.copy_(trainable_snapshot[name])
-        model.zero_grad(set_to_none=True)
-
-    lr_losses: dict[float, float] = {}
-    for lr in lr_candidates:
-        _restore_trainable_weights()
-        print(f"  [LR Finder] Testing LR {lr:.2e} ...", flush=True)
-        loss = _micro_train(
-            model,
-            tokenizer,
-            dataloader,
-            lr,
-            text_key,
-            steps,
-            device,
-            seq_len=seq_len,
-            optimizer_name=optimizer_name,
-        )
-        lr_losses[lr] = loss
-        print(f"    avg loss = {loss:.4f}", flush=True)
-
-    finite_losses = {lr: loss for lr, loss in lr_losses.items() if math.isfinite(loss)}
-    if not finite_losses:
-        print("  [LR Finder] All LR candidates produced NaN/Inf loss.", flush=True)
-        # Return the smallest LR as the safest fallback
-        return min(lr_losses.keys())
-
-    # Prefer the largest LR whose loss is close to the best loss.
-    # This better matches "largest stable LR" than pure argmin on noisy micro-runs.
-    best_loss = min(finite_losses.values())
-    tol = max(1e-4, 0.02 * abs(best_loss))
-    near_best = [lr for lr, loss in finite_losses.items() if loss <= best_loss + tol]
-    best_lr = max(near_best) if near_best else min(finite_losses, key=finite_losses.get)
-    print(
-        f"  [LR Finder] Best LR: {best_lr:.2e}  "
-        f"(best_loss={best_loss:.4f}, tol=+{tol:.4f})",
-        flush=True,
-    )
-    return best_lr
-
-
-def _run_with_auto_batch(
-    model,
-    tokenizer,
-    dataset: Dataset,
-    safe_batch: int,
-    lr_candidates: list[float],
-    text_key: str,
-    steps: int,
-    device: str,
-    seq_len: int = 512,
-    optimizer_name: Optional[str] = None,
-    collate_fn: Optional[Callable] = None,
-) -> tuple[float, int]:
-    trainable_snapshot = {
-        name: param.detach().clone()
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    }
-
-    def _restore_trainable_weights() -> None:
-        for name, param in model.named_parameters():
-            if name in trainable_snapshot:
-                param.data.copy_(trainable_snapshot[name])
-        model.zero_grad(set_to_none=True)
-
-    # Same as Leslie Smith ramp: one forward per row (DPO: ``chosen`` only).
-    start_batch = max(1, safe_batch)
-    batch_size = start_batch
-
-    while batch_size >= 1:
-        try:
-            _restore_trainable_weights()
-            # shuffle=False: _load_sample_dataset already shuffled; keeps batch order
-            # identical across LR candidates so losses are comparable.
-            dl = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                collate_fn=collate_fn,
-            )
-            best_lr = _pick_best_lr(
-                model,
-                tokenizer,
-                dl,
-                lr_candidates,
-                text_key,
-                steps,
-                device,
-                seq_len=seq_len,
-                optimizer_name=optimizer_name,
-            )
+            best_lr = _pick_lr_largest_near_best_loss(lr_losses)
+            print(f"  [LR Finder] selected LR from mini-train grid: {best_lr:.2e}", flush=True)
             return best_lr, batch_size
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
@@ -725,25 +278,8 @@ def _run_with_auto_batch(
 
 
 # --------------------------------------------------------------------------- #
-# Dataset loading — shuffled subset for probing
+# Dataset loading — 2% of tokenized instruct JSON
 # --------------------------------------------------------------------------- #
-
-def _resolve_smith_curve_mode(
-    dataset_type_dict: dict,
-    fallback: Literal["steepest", "max_decreasing"],
-) -> Literal["steepest", "max_decreasing"]:
-    """Normalize mode strings so typos in ``train_info`` cannot silently select the wrong branch."""
-    fb = str(fallback).strip().lower().replace("-", "_")
-    if fb not in ("steepest", "max_decreasing"):
-        fb = "max_decreasing"
-    raw = dataset_type_dict.get("lr_finder_smith_curve_mode")
-    if raw is None:
-        return fb  # type: ignore[return-value]
-    t = str(raw).strip().lower().replace("-", "_")
-    if t in ("steepest", "max_decreasing"):
-        return t  # type: ignore[return-value]
-    return fb  # type: ignore[return-value]
-
 
 def _config_bool_or_default(value, default: bool) -> bool:
     """Parse booleans from JSON/YAML; treat ``None`` as *use default*."""
@@ -760,66 +296,6 @@ def _config_bool_or_default(value, default: bool) -> bool:
         if s in ("1", "true", "yes", "y", "on"):
             return True
     return bool(value)
-
-
-def _adaptive_probe_sample_count(
-    n_rows: int,
-    *,
-    frac: float,
-    min_n: int,
-    max_n: int,
-) -> int:
-    """How many rows to use for the LR probe given full dataset size."""
-    if n_rows <= 0:
-        return 0
-    target = max(min_n, int(n_rows * frac))
-    capped = min(target, max_n, n_rows)
-    # Avoid sample_count=0 when rows exist (empty DataLoader would make
-    # ``_iter_batches_forever`` spin forever).
-    return max(1, capped)
-
-
-def _stratified_sample_by_text_length(
-    rows: list[dict],
-    text_key: str,
-    k: int,
-    seed: int,
-) -> list[dict]:
-    """
-    Spread probe examples across short→long texts (quartiles) so the loss
-    landscape is not dominated by a random slice of similar lengths.
-    """
-    rng = random.Random(seed)
-    valid_idx = [i for i, r in enumerate(rows) if (r.get(text_key) or "").strip()]
-    if not valid_idx:
-        valid_idx = list(range(len(rows)))
-    if len(valid_idx) <= k:
-        return [rows[i] for i in valid_idx]
-
-    valid_idx.sort(key=lambda i: len((rows[i].get(text_key) or "")))
-    if k < 4 or len(valid_idx) < 4:
-        rng.shuffle(valid_idx)
-        return [rows[i] for i in valid_idx[:k]]
-
-    n_bins = 4
-    per, rem = divmod(k, n_bins)
-    picked: list[int] = []
-    for b in range(n_bins):
-        lo = b * len(valid_idx) // n_bins
-        hi = (b + 1) * len(valid_idx) // n_bins
-        bucket = valid_idx[lo:hi]
-        take = per + (1 if b < rem else 0)
-        if not bucket or take <= 0:
-            continue
-        rng.shuffle(bucket)
-        picked.extend(bucket[:take])
-
-    if len(picked) < k:
-        pool = [i for i in valid_idx if i not in set(picked)]
-        rng.shuffle(pool)
-        picked.extend(pool[: k - len(picked)])
-    rng.shuffle(picked)
-    return [rows[i] for i in picked[:k]]
 
 
 def _stratified_sample_by_token_length(
@@ -912,17 +388,13 @@ def _make_tokenized_collate_fn(
     return _collate
 
 
-def _load_tokenized_sample_dataset(
+def _load_tokenized_probe_two_percent(
     tokenized_path: str,
     *,
-    sample_frac: float,
-    sample_min: int,
-    sample_max: int,
     stratify_by_length: bool,
     seed: int,
-    use_full: bool,
-    full_cap: int,
 ) -> tuple[Dataset, str]:
+    """Exactly 2% of rows (min 1), same format as ``MyDataset`` / ``train_tokenized_*.json``."""
     with open(tokenized_path, "r", encoding="utf-8") as f:
         raw_list = json.load(f)
     if not isinstance(raw_list, list):
@@ -937,12 +409,8 @@ def _load_tokenized_sample_dataset(
     if n_rows == 0:
         return Dataset.from_list([]), TOKENIZED_BATCH_KEY
 
-    if use_full:
-        sample_count = min(n_rows, max(1, full_cap))
-    else:
-        sample_count = _adaptive_probe_sample_count(
-            n_rows, frac=sample_frac, min_n=sample_min, max_n=sample_max
-        )
+    sample_count = max(1, int(n_rows * 0.02))
+    sample_count = min(sample_count, n_rows)
 
     if stratify_by_length:
         subset = _stratified_sample_by_token_length(data, sample_count, seed)
@@ -954,63 +422,6 @@ def _load_tokenized_sample_dataset(
     return Dataset.from_list(subset), TOKENIZED_BATCH_KEY
 
 
-def _load_sample_dataset(
-    dataset_path: str,
-    dataset_type_dict: dict,
-    train_type: str,
-    *,
-    sample_frac: float = 0.02,
-    sample_min: int = 200,
-    sample_max: int = 3000,
-    stratify_by_length: bool = True,
-    seed: int = 42,
-) -> tuple[Dataset, str]:
-    raw = load_dataset("json", data_files=dataset_path)["train"]
-
-    if train_type == "dpo":
-        chosen_key = dataset_type_dict.get("field_chosen", "chosen")
-        rejected_key = dataset_type_dict.get("field_rejected", "rejected")
-
-        def _map_dpo(ex):
-            return {
-                "text": example_to_text(ex, dataset_type_dict),
-                "chosen": ex.get(chosen_key, ""),
-                "rejected": ex.get(rejected_key, ""),
-            }
-
-        ds = raw.map(_map_dpo, remove_columns=raw.column_names)
-        text_key = "chosen"  # forward pass on chosen text for loss
-
-    elif train_type == "grpo":
-        prompt_key = dataset_type_dict.get("field_prompt", "prompt")
-
-        def _map_grpo(ex):
-            return {"text": ex.get(prompt_key) or example_to_text(ex, dataset_type_dict)}
-
-        ds = raw.map(_map_grpo, remove_columns=raw.column_names)
-        text_key = "text"
-
-    else:  # instruct (default)
-        def _map_instruct(ex):
-            return {"text": example_to_text(ex, dataset_type_dict)}
-
-        ds = raw.map(_map_instruct, remove_columns=raw.column_names)
-        text_key = "text"
-
-    data = list(ds)
-    sample_count = _adaptive_probe_sample_count(
-        len(data), frac=sample_frac, min_n=sample_min, max_n=sample_max
-    )
-    if stratify_by_length:
-        subset = _stratified_sample_by_text_length(data, text_key, sample_count, seed)
-    else:
-        rng = random.Random(seed)
-        rng.shuffle(data)
-        subset = data[:sample_count]
-
-    return Dataset.from_list(subset), text_key
-
-
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -1019,94 +430,79 @@ def find_lr(
     model_id: str,
     model_path: str,
     num_params: Optional[int],
-    dataset_path: str,
+    tokenized_dataset_path: str,
     dataset_type_dict: dict,
-    train_type: str = "instruct",
-    min_lr: float = 6e-6,
-    max_lr: float = 1e-3,
-    # Grid search only; Leslie Smith uses `steps` as the number of schedule points.
-    lr_points: int = 30,
-    steps: int = 20,
-    seq_len: int = 512,
-    # LoRA config — should match the actual training setup for this task so
-    # that the probed LR is representative of the real loss landscape.
-    # Pass lora_threshold=None to disable LoRA entirely (e.g. full-weight SFT).
-    lora_threshold: Optional[int] = _DEFAULT_LORA_THRESHOLD,
+    *,
+    min_lr: float = 1e-6,
+    max_lr: float = 9e-3,
+    lr_probe_points: int = 28,
+    mini_train_batches: int = 3,
+    seq_len: int = 1024,
+    lora_threshold: Optional[int] = None,
     lora_r: int = _DEFAULT_LORA_R,
     lora_alpha: int = _DEFAULT_LORA_ALPHA,
     lora_dropout: float = _DEFAULT_LORA_DROPOUT,
-    # e.g. "paged_adamw_8bit" to match GRPO/SFT training; None → AdamW on trainable only.
     optimizer_name: Optional[str] = None,
-    # Leslie Smith exponential ramp (single run) vs independent grid micro-runs.
-    search_mode: Literal["leslie_smith", "grid"] = "leslie_smith",
-    # Divide raw steepest-descent LR by this (then clamp to [min_lr, max_lr]).
-    # None → 10 for full finetune, 5 for LoRA (steepest point is often ~10× too high to train).
-    smith_safety_divisor: Optional[float] = None,
-    # Smith ramp: accumulate this many micro-batches per LR point (stabler curve; linear time).
-    smith_micro_batches: int = 1,
-    # Stop ramp early when loss ≫ min loss so far (saves time past the useful LR band).
-    smith_early_stop_divergence: bool = True,
-    smith_divergence_vs_min: float = 10.0,
-    smith_min_points_before_divergence: int = 5,
-    # Probe subset: size scales with dataset rows; cap avoids huge JSON files.
-    lr_sample_frac: float = 0.02,
-    lr_sample_min: int = 200,
-    lr_sample_max: int = 3000,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
-    # Synthetic max batch → B_train = headroom × B_max (default 0.8); training uses
-    # min(B_train, batch that fits on real tokenized batches).
     batch_headroom: float = 0.8,
-    smith_curve_mode: Literal["steepest", "max_decreasing"] = "max_decreasing",
-    # Instruct: JSON list of {input_ids, attention_mask, labels} (``train_tokenized_*.json``).
-    # DPO/GRPO: optional path to the per-task training JSON (``dpo_train_*.json`` / ``grpo_train_*.json``)
-    # — same text columns as ``train_dpo`` / ``train_grpo``; probe uses 2% (or full flags) of that file.
-    tokenized_dataset_path: Optional[str] = None,
-    # If True, use (almost) all tokenized rows, capped by ``lr_finder_tokenized_full_cap`` (memory safety).
-    # If False, use the same adaptive fraction as raw JSON (default ~2% with min/max).
-    lr_finder_use_full_tokenized_dataset: bool = False,
-    lr_finder_tokenized_full_cap: int = 10_000,
+    grpo_slow_reward_proxy_probe: bool = False,
 ) -> Optional[dict]:
+    """
+    Pick LR by **mini-training** each log-spaced candidate on **2%** of the tokenized
+    instruct dataset (``train_tokenized_*.json``). Batch size starts at the synthetic
+    safety probe (headroom × max batch), then halves on OOM until real batches fit.
+
+    Mini-train always optimizes **causal LM cross-entropy (SFT-style)** on padded
+    ``labels`` — never GRPO reward functions or rollouts. For GRPO jobs with slow
+    rewards, pass ``grpo_slow_reward_proxy_probe=True`` so logs state explicitly
+    that expensive rewards are not used in this phase.
+    """
+    if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
+        print(
+            "[LR Finder] tokenized_dataset_path missing or not a file; need train_tokenized JSON.",
+            flush=True,
+        )
+        return None
+
     use_lora = (
         lora_threshold is not None
         and num_params is not None
         and num_params >= lora_threshold
     )
-    eff_smith_div = (
-        smith_safety_divisor
-        if smith_safety_divisor is not None
-        else (5.0 if use_lora else 10.0)
+    _points = max(
+        2,
+        int(dataset_type_dict.get("lr_finder_lr_probe_points", lr_probe_points)),
     )
-    if eff_smith_div <= 0:
-        raise ValueError("smith_safety_divisor must be positive.")
-    _mb = max(1, min(8, int(smith_micro_batches)))
+    _mini_b = max(
+        1,
+        int(dataset_type_dict.get("lr_finder_mini_train_batches", mini_train_batches)),
+    )
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    _proxy_grpo = bool(
+        dataset_type_dict.get("lr_finder_grpo_slow_reward_proxy", grpo_slow_reward_proxy_probe)
+    )
     _opt_disp = optimizer_name or "adamw_torch"
+    _probe_tag = (
+        "GRPO_slow_reward→SFT_CE_proxy"
+        if _proxy_grpo
+        else "tokenized_SFT_CE"
+    )
     print(
-        f"[LR Finder] model={model_id}  type={train_type}  "
-        f"params={num_params}  lora={use_lora}"
+        f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
-        + f"  optim={_opt_disp}  search={search_mode}  micro_steps={steps}"
-        + (f"  lr_points={lr_points}" if search_mode == "grid" else "")
-        + (
-            f"  smith_safety_divisor={eff_smith_div:g}"
-            if search_mode == "leslie_smith"
-            else ""
-        )
-        + (
-            f"  smith_micro_batches={_mb}"
-            f"  smith_early_stop={smith_early_stop_divergence}"
-            if search_mode == "leslie_smith"
-            else ""
-        )
-        + (
-            f"  smith_curve={_resolve_smith_curve_mode(dataset_type_dict, smith_curve_mode)}"
-            if search_mode == "leslie_smith"
-            else ""
-        ),
+        + f"  optim={_opt_disp}  probe=2%_tokenized  lr_probe_points={_points}"
+        + f"  mini_train_batches={_mini_b}",
         flush=True,
     )
+    if _proxy_grpo:
+        print(
+            "[LR Finder] GRPO slow-reward task: this probe uses **SFT cross-entropy only** "
+            "on tokenized JSON (no rollouts, no reward funcs — langcheck/detoxify/textstat/etc.). "
+            "Found LR/batch apply to full GRPO training afterward.",
+            flush=True,
+        )
 
     try:
         # ------------------------------------------------------------------ #
@@ -1166,187 +562,64 @@ def find_lr(
             flush=True,
         )
         safe_batch = b_train
-        _curve_mode = _resolve_smith_curve_mode(dataset_type_dict, smith_curve_mode)
 
-        # ------------------------------------------------------------------ #
-        # Load dataset sample (size from row count; see _load_sample_dataset)
-        # ------------------------------------------------------------------ #
-        _frac = float(
-            dataset_type_dict.get("lr_finder_sample_frac", lr_sample_frac)
-        )
-        _smin = int(dataset_type_dict.get("lr_finder_sample_min", lr_sample_min))
-        _smax = int(dataset_type_dict.get("lr_finder_sample_max", lr_sample_max))
         _strat = _config_bool_or_default(
             dataset_type_dict.get("lr_finder_stratify_length"),
             lr_sample_stratify,
         )
-        _sseed = int(
-            dataset_type_dict.get("lr_finder_sample_seed", lr_sample_seed)
+        _sseed = int(dataset_type_dict.get("lr_finder_sample_seed", lr_sample_seed))
+
+        print(
+            f"[LR Finder] Loading 2% subset of tokenized data: {tokenized_dataset_path} …",
+            flush=True,
+        )
+        sample_ds, _ = _load_tokenized_probe_two_percent(
+            tokenized_dataset_path,
+            stratify_by_length=_strat,
+            seed=_sseed,
+        )
+        collate_fn = _make_tokenized_collate_fn(tokenizer, seq_len)
+        print(
+            f"[LR Finder] Probe rows: {len(sample_ds)}  (2% of tokenized set; "
+            f"stratify_by_token_len={_strat})",
+            flush=True,
         )
 
-        # DPO/GRPO: prefer the on-disk training split (same JSON as production training).
-        if train_type in ("dpo", "grpo"):
-            _split = (
-                tokenized_dataset_path
-                or dataset_type_dict.get("dpo_train_path")
-                or dataset_type_dict.get("grpo_train_path")
-            )
-            if _split and os.path.isfile(_split):
-                text_probe_path = _split
-                print(
-                    f"[LR Finder] Probe uses training-split JSON (same as train_{train_type}): "
-                    f"{text_probe_path}",
-                    flush=True,
-                )
-            else:
-                text_probe_path = dataset_path
-        else:
-            text_probe_path = dataset_path
-
-        _tok_path = (
-            tokenized_dataset_path
-            or dataset_type_dict.get("tokenized_train_path")
-            or dataset_type_dict.get("tokenized_train")
-        )
-        _use_full_tok = _config_bool_or_default(
-            dataset_type_dict.get("lr_finder_use_full_tokenized_dataset"),
-            lr_finder_use_full_tokenized_dataset,
-        )
-        _tok_cap = int(
-            dataset_type_dict.get(
-                "lr_finder_tokenized_full_cap", lr_finder_tokenized_full_cap
-            )
-        )
-        use_tokenized = (
-            train_type == "instruct"
-            and _tok_path
-            and os.path.isfile(_tok_path)
-        )
-
-        collate_fn: Optional[Callable] = None
-        if use_tokenized:
-            print(
-                f"[LR Finder] Loading tokenized training data from {_tok_path} …",
-                flush=True,
-            )
-            sample_ds, text_key = _load_tokenized_sample_dataset(
-                _tok_path,
-                sample_frac=_frac,
-                sample_min=_smin,
-                sample_max=_smax,
-                stratify_by_length=_strat,
-                seed=_sseed,
-                use_full=_use_full_tok,
-                full_cap=max(1, _tok_cap),
-            )
-            collate_fn = _make_tokenized_collate_fn(tokenizer, seq_len)
-            mode = (
-                f"full rows (cap={_tok_cap})"
-                if _use_full_tok
-                else f"adaptive subset frac={_frac:g} min={_smin} max={_smax}"
-            )
-            print(
-                f"[LR Finder] Tokenized sample: {len(sample_ds)} rows  ({mode}; "
-                f"stratify_by_token_len={_strat})",
-                flush=True,
-            )
-        else:
-            if not text_probe_path or not str(text_probe_path).strip():
-                print(
-                    "[LR Finder] No dataset path and no usable training-split / tokenized file; "
-                    "cannot run LR search.",
-                    flush=True,
-                )
-                return None
-            print(f"[LR Finder] Loading sample subset of {text_probe_path} …", flush=True)
-            sample_ds, text_key = _load_sample_dataset(
-                text_probe_path,
-                dataset_type_dict,
-                train_type,
-                sample_frac=_frac,
-                sample_min=_smin,
-                sample_max=_smax,
-                stratify_by_length=_strat,
-                seed=_sseed,
-            )
-            print(
-                f"[LR Finder] Sample: {len(sample_ds)} rows  "
-                f"(frac={_frac:g}  min={_smin}  max={_smax}  "
-                f"stratify_len={_strat})",
-                flush=True,
-            )
         if len(sample_ds) == 0:
-            print(
-                "[LR Finder] Empty dataset sample; cannot run LR search.",
-                flush=True,
-            )
+            print("[LR Finder] Empty probe sample; cannot run LR search.", flush=True)
             return None
 
-        # ------------------------------------------------------------------ #
-        # LR search: Leslie Smith ramp or discrete grid
-        # ------------------------------------------------------------------ #
-        if search_mode == "leslie_smith":
-            lr_schedule = get_lr_candidates(min_lr, max_lr, steps)
-            print(
-                f"[LR Finder] Leslie Smith LR ramp: {steps} steps  "
-                f"{min_lr:.2e} → {max_lr:.2e}",
-                flush=True,
-            )
-            best_lr, probe_batch = _run_smith_with_auto_batch(
-                model,
-                tokenizer,
-                sample_ds,
-                safe_batch,
-                lr_schedule,
-                text_key,
-                device,
-                seq_len=seq_len,
-                optimizer_name=optimizer_name,
-                min_lr=min_lr,
-                max_lr=max_lr,
-                smith_safety_divisor=eff_smith_div,
-                smith_micro_batches=_mb,
-                smith_early_stop_divergence=smith_early_stop_divergence,
-                smith_divergence_vs_min=smith_divergence_vs_min,
-                smith_min_points_before_divergence=smith_min_points_before_divergence,
-                smith_curve_mode=_curve_mode,
-                collate_fn=collate_fn,
-            )
-        else:
-            lr_candidates = get_lr_candidates(min_lr, max_lr, lr_points)
-            print(
-                f"[LR Finder] Grid sweep: {lr_points} LRs: {min_lr:.2e} → {max_lr:.2e}",
-                flush=True,
-            )
-            best_lr, probe_batch = _run_with_auto_batch(
-                model,
-                tokenizer,
-                sample_ds,
-                safe_batch,
-                lr_candidates,
-                text_key,
-                steps,
-                device,
-                seq_len=seq_len,
-                optimizer_name=optimizer_name,
-                collate_fn=collate_fn,
-            )
+        lr_candidates = get_lr_candidates(min_lr, max_lr, _points)
+        print(
+            f"[LR Finder] Mini-train LR grid: {_points} candidates  {min_lr:.2e} → {max_lr:.2e}",
+            flush=True,
+        )
+        best_lr, probe_batch = _run_mini_train_lr_grid(
+            model,
+            sample_ds,
+            safe_batch,
+            lr_candidates,
+            device,
+            optimizer_name=optimizer_name,
+            mini_train_batches=_mini_b,
+            collate_fn=collate_fn,
+        )
 
         train_batch = min(b_train, probe_batch)
         print(
             f"[LR Finder] Selected LR: {best_lr:.2e}  "
-            f"(probe on real data: batch_size={probe_batch}; "
-            f"B_train={b_train}; training batch_size=min(B_train, probe)={train_batch})",
+            f"(probe batch_size={probe_batch}; B_train={b_train}; "
+            f"training batch_size=min(B_train, probe)={train_batch})",
             flush=True,
         )
         return {
             "lr": best_lr,
-            # Prefer B_train = headroom×B_max, but never exceed what fit real tokenized batches.
             "batch_size": train_batch,
             "b_max_synthetic": b_max,
             "b_train_synthetic": b_train,
             "probe_batch_real_data": probe_batch,
-            "smith_curve_mode": _curve_mode,
+            "lr_probe_points": _points,
+            "mini_train_batches": _mini_b,
         }
 
     except Exception as exc:

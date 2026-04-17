@@ -7,13 +7,8 @@ from model_utility import (
     get_gpu_count,
 )
 from copy import deepcopy
-import os
 
-from lrs_lookup import get_dpo_lr, is_dpo_grpo_lr_finder_runnable
-
-_DPO_LR_FINDER_SCALE = 0.32
-_DPO_LR_CAP_MULT = 1.75
-_DPO_LR_FLOOR_MULT = 0.30
+from lrs_lookup import apply_tokenized_lr_finder_to_run_config
 
 
 def _bs_from_param_nums(param_nums) -> int:
@@ -164,104 +159,33 @@ def get_training_json(train_info: dict) -> dict:
             if train_info.get("is_openai", False)
             else ""
         ),
-        "lr_finder_steps": int(train_info.get("lr_finder_steps", 28)),
-        "lr_finder_points": int(train_info.get("lr_finder_points", 30)),
-        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 512)),
-        "lr_finder_smith_micro_batches": int(train_info.get("lr_finder_smith_micro_batches", 1)),
-        "lr_finder_smith_early_stop": bool(train_info.get("lr_finder_smith_early_stop", True)),
-        "lr_finder_smith_divergence_mult": float(
-            train_info.get("lr_finder_smith_divergence_mult", 10.0)
-        ),
-        "lr_finder_smith_min_points": int(train_info.get("lr_finder_smith_min_points", 5)),
-        "lr_finder_sample_frac": float(train_info.get("lr_finder_sample_frac", 0.02)),
-        "lr_finder_sample_min": int(train_info.get("lr_finder_sample_min", 200)),
-        "lr_finder_sample_max": int(train_info.get("lr_finder_sample_max", 3000)),
-        "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
-        "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
-        "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
-        "lr_finder_smith_curve_mode": train_info.get(
-            "lr_finder_smith_curve_mode", "max_decreasing"
-        ),
         "warmup_steps": int(train_info.get("dpo_warmup_steps", 180)),
         "beta": float(train_info.get("dpo_beta", 0.08)),
         "max_grad_norm": float(train_info.get("dpo_max_grad_norm", 0.35)),
+        # Probe: mini-train on 2% of tokenized JSON; batch = safety (synthetic × headroom, OOM-safe).
+        "lr_finder_lr_probe_points": int(
+            train_info.get(
+                "lr_finder_lr_probe_points",
+                train_info.get("lr_finder_steps", 28),
+            )
+        ),
+        "lr_finder_mini_train_batches": int(
+            train_info.get("lr_finder_mini_train_batches", 3)
+        ),
+        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
+        "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
+        "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
+        "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
     }
 
-    dataset_path = train_info.get("dataset", "")
-    dataset_type_dict = dict(train_info.get("dataset_type", {}))
-
-    dpo_train_path = train_info.get("dpo_train_path")
-    if not dpo_train_path and train_info.get("task_id"):
-        _cand = f"datasets/dpo_train_{train_info['task_id']}.json"
-        dpo_train_path = _cand if os.path.isfile(_cand) else None
-    elif dpo_train_path and not os.path.isfile(dpo_train_path):
-        dpo_train_path = None
-    if dpo_train_path:
-        dataset_type_dict["dpo_train_path"] = dpo_train_path
-
-    if not is_dpo_grpo_lr_finder_runnable(dataset_path, dpo_train_path):
-        print(
-            "[LR Finder] Skipping: no dataset path and no dpo_train JSON; "
-            "using param-based learning rate.",
-            flush=True,
-        )
-    else:
-        lr_result = get_dpo_lr(
-            model_name,
-            model_path,
-            param_nums,
-            dataset_path,
-            dataset_type_dict,
-            seq_len=run_config["lr_finder_seq_len"],
-            steps=run_config["lr_finder_steps"],
-            lr_points=run_config["lr_finder_points"],
-            optimizer_name=run_config["optimizer"],
-            smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
-            smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
-            smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
-            smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
-            lr_sample_frac=run_config["lr_finder_sample_frac"],
-            lr_sample_min=run_config["lr_finder_sample_min"],
-            lr_sample_max=run_config["lr_finder_sample_max"],
-            lr_sample_stratify=run_config["lr_finder_stratify_length"],
-            lr_sample_seed=run_config["lr_finder_sample_seed"],
-            batch_headroom=run_config["lr_finder_batch_headroom"],
-            smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
-            tokenized_dataset_path=dpo_train_path,
-        )
-
-        if lr_result is not None:
-            lr = lr_result.get("lr")
-            bs = lr_result.get("batch_size")
-
-            if lr is not None:
-                fallback_lr = _lr_from_param_nums(param_nums)
-                scaled = lr * _DPO_LR_FINDER_SCALE
-                cap = fallback_lr * _DPO_LR_CAP_MULT
-                floor = fallback_lr * _DPO_LR_FLOOR_MULT
-                applied = max(floor, min(scaled, cap))
-                run_config["learning_rate"] = applied
-                print(
-                    f"Using lr from dynamic finder: raw={lr}, "
-                    f"DPO-scaled×{_DPO_LR_FINDER_SCALE}={scaled}, "
-                    f"band=[{floor},{cap}], applied={applied} "
-                    f"(fallback heuristic={fallback_lr})",
-                    flush=True,
-                )
-            else:
-                fallback_lr = _lr_from_param_nums(param_nums)
-                print(f"LR finder returned no lr, using param-based fallback: {fallback_lr}", flush=True)
-                run_config["learning_rate"] = fallback_lr
-
-            if bs is not None:
-                print(f"Using batch size from dynamic finder: {bs}", flush=True)
-                run_config["batch_size"] = bs
-        else:
-            print(
-                "[LR Finder] Probe failed or errored; using param-based learning rate: "
-                f"{run_config['learning_rate']}",
-                flush=True,
-            )
+    apply_tokenized_lr_finder_to_run_config(
+        run_config,
+        train_info,
+        model_name,
+        model_path,
+        param_nums,
+        fallback_learning_rate=_lr_from_param_nums(param_nums),
+    )
 
     # Keep scheduling math safe even when GPU auto-detection fails.
     effective_gpu_nums = max(1, run_config["gpu_nums"])

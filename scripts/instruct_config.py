@@ -5,9 +5,8 @@ from model_utility import (
     disable_flash_attention,
     get_gpu_count,
 )
-import os
 from copy import deepcopy
-from lrs_lookup import get_instruct_lr, is_instruct_lr_finder_runnable
+from lrs_lookup import apply_tokenized_lr_finder_to_run_config
 
 
 def get_run_cmd(config: dict, gpu_nums: int):
@@ -146,103 +145,30 @@ def get_training_json(train_info: dict) -> dict:
             if train_info.get("is_openai", False)
             else ""
         ),
-        # Fewer Smith points = faster probe; override with train_info["lr_finder_steps"].
-        "lr_finder_steps": int(train_info.get("lr_finder_steps", 28)),
-        "lr_finder_points": int(train_info.get("lr_finder_points", 30)),
-        # Match typical instruct max_length in tokenize_instruct / training (override via train_info if set).
-        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
-        "lr_finder_smith_micro_batches": int(train_info.get("lr_finder_smith_micro_batches", 1)),
-        "lr_finder_smith_early_stop": bool(train_info.get("lr_finder_smith_early_stop", True)),
-        "lr_finder_smith_divergence_mult": float(
-            train_info.get("lr_finder_smith_divergence_mult", 10.0)
+        # Probe: mini-train on 2% of tokenized JSON; batch = safety (synthetic × headroom, OOM-safe).
+        "lr_finder_lr_probe_points": int(
+            train_info.get(
+                "lr_finder_lr_probe_points",
+                train_info.get("lr_finder_steps", 28),
+            )
         ),
-        "lr_finder_smith_min_points": int(train_info.get("lr_finder_smith_min_points", 5)),
-        "lr_finder_sample_frac": float(train_info.get("lr_finder_sample_frac", 0.02)),
-        "lr_finder_sample_min": int(train_info.get("lr_finder_sample_min", 200)),
-        "lr_finder_sample_max": int(train_info.get("lr_finder_sample_max", 3000)),
+        "lr_finder_mini_train_batches": int(
+            train_info.get("lr_finder_mini_train_batches", 3)
+        ),
+        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
-        "lr_finder_smith_curve_mode": train_info.get(
-            "lr_finder_smith_curve_mode", "max_decreasing"
-        ),
-        # Tokenized probe: use all rows up to this cap when ``lr_finder_use_full_tokenized_dataset`` is True.
-        "lr_finder_use_full_tokenized_dataset": bool(
-            train_info.get("lr_finder_use_full_tokenized_dataset", False)
-        ),
-        "lr_finder_tokenized_full_cap": int(
-            train_info.get("lr_finder_tokenized_full_cap", 10_000)
-        ),
     }
 
-    dataset_path = train_info.get("dataset", "")
-    dataset_type_dict = dict(train_info.get("dataset_type", {}))
-
-    tokenized_train_path = train_info.get("tokenized_train_path")
-    if not tokenized_train_path and train_info.get("task_id"):
-        _candidate = f"datasets/train_tokenized_{train_info['task_id']}.json"
-        tokenized_train_path = _candidate if os.path.isfile(_candidate) else None
-    elif tokenized_train_path and not os.path.isfile(tokenized_train_path):
-        tokenized_train_path = None
-    if tokenized_train_path:
-        dataset_type_dict["tokenized_train_path"] = tokenized_train_path
-
-    if not is_instruct_lr_finder_runnable(dataset_path, tokenized_train_path):
-        print(
-            "[LR Finder] Skipping: no raw dataset path and no tokenized train file; "
-            "using param-based learning rate.",
-            flush=True,
-        )
-    else:
-        lr_result = get_instruct_lr(
-            model_name,
-            model_path,
-            param_nums,
-            dataset_path,
-            dataset_type_dict,
-            seq_len=run_config["lr_finder_seq_len"],
-            steps=run_config["lr_finder_steps"],
-            lr_points=run_config["lr_finder_points"],
-            optimizer_name=run_config["optimizer"],
-            smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
-            smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
-            smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
-            smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
-            lr_sample_frac=run_config["lr_finder_sample_frac"],
-            lr_sample_min=run_config["lr_finder_sample_min"],
-            lr_sample_max=run_config["lr_finder_sample_max"],
-            lr_sample_stratify=run_config["lr_finder_stratify_length"],
-            lr_sample_seed=run_config["lr_finder_sample_seed"],
-            batch_headroom=run_config["lr_finder_batch_headroom"],
-            smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
-            tokenized_dataset_path=tokenized_train_path,
-            lr_finder_use_full_tokenized_dataset=run_config[
-                "lr_finder_use_full_tokenized_dataset"
-            ],
-            lr_finder_tokenized_full_cap=run_config["lr_finder_tokenized_full_cap"],
-        )
-
-        if lr_result is not None:
-            lr = lr_result.get("lr")
-            bs = lr_result.get("batch_size")
-
-            if lr is not None:
-                print(f"Using lr from dynamic finder: {lr}", flush=True)
-                run_config["learning_rate"] = lr
-            else:
-                fallback_lr = _lr_from_param_nums(param_nums)
-                print(f"LR finder returned no lr, using param-based fallback: {fallback_lr}", flush=True)
-                run_config["learning_rate"] = fallback_lr
-
-            if bs is not None:
-                print(f"Using batch size from dynamic finder: {bs}", flush=True)
-                run_config["batch_size"] = bs
-        else:
-            print(
-                "[LR Finder] Probe failed or errored; using param-based learning rate: "
-                f"{run_config['learning_rate']}",
-                flush=True,
-            )
+    apply_tokenized_lr_finder_to_run_config(
+        run_config,
+        train_info,
+        model_name,
+        model_path,
+        param_nums,
+        fallback_learning_rate=_lr_from_param_nums(param_nums),
+    )
 
     # Keep scheduling math safe even when GPU auto-detection fails.
     effective_gpu_nums = max(1, run_config["gpu_nums"])

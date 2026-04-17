@@ -7,9 +7,9 @@ from model_utility import (
     get_gradient_checkpointing,
     get_gpu_count,
 )
-import os
 from copy import deepcopy
-from lrs_lookup import get_grpo_lr, get_grpo_python_lr, is_dpo_grpo_lr_finder_runnable
+
+from lrs_lookup import apply_tokenized_lr_finder_to_run_config
 
 
 def _bs_from_param_nums(param_nums) -> int:
@@ -89,7 +89,7 @@ def _slow_reward_bs_from_param_nums(param_nums) -> int:
 
 
 def if_contain_slow_reward_function(dataset_type: dict) -> bool:
-    reward_functions = dataset_type["reward_functions"]
+    reward_functions = dataset_type.get("reward_functions") or []
     for reward_func in reward_functions:
         func_def = reward_func["reward_func"]
         keywords = [
@@ -100,16 +100,6 @@ def if_contain_slow_reward_function(dataset_type: dict) -> bool:
             "import textstat",
             "from textstat",
         ]
-        if any(keyword in func_def for keyword in keywords):
-            return True
-    return False
-
-
-def contain_python_execution(dataset_type: dict) -> bool:
-    reward_functions = dataset_type["reward_functions"]
-    for reward_func in reward_functions:
-        func_def = reward_func["reward_func"]
-        keywords = ["sat_reward_function", "ded_reward_function", "abd_reward_function"]
         if any(keyword in func_def for keyword in keywords):
             return True
     return False
@@ -227,25 +217,40 @@ def get_training_json(train_info: dict) -> dict:
         "use_vllm": False if gpu_nums <= 1 else get_use_vllm(model_architecture, model_name),
         "tensor_parallel": False,
         "use_4bit": _use_4bit_from_param_nums(param_nums),
-        # LR finder micro-train (align with instruct-style probe depth + training optim).
-        "lr_finder_steps": int(train_info.get("lr_finder_steps", 28)),
-        "lr_finder_points": int(train_info.get("lr_finder_points", 30)),
-        "lr_finder_smith_micro_batches": int(train_info.get("lr_finder_smith_micro_batches", 1)),
-        "lr_finder_smith_early_stop": bool(train_info.get("lr_finder_smith_early_stop", True)),
-        "lr_finder_smith_divergence_mult": float(
-            train_info.get("lr_finder_smith_divergence_mult", 10.0)
+        # Probe: mini-train on 2% of tokenized JSON; batch = safety (synthetic × headroom, OOM-safe).
+        "lr_finder_lr_probe_points": int(
+            train_info.get(
+                "lr_finder_lr_probe_points",
+                train_info.get("lr_finder_steps", 28),
+            )
         ),
-        "lr_finder_smith_min_points": int(train_info.get("lr_finder_smith_min_points", 5)),
-        "lr_finder_sample_frac": float(train_info.get("lr_finder_sample_frac", 0.02)),
-        "lr_finder_sample_min": int(train_info.get("lr_finder_sample_min", 200)),
-        "lr_finder_sample_max": int(train_info.get("lr_finder_sample_max", 3000)),
+        "lr_finder_mini_train_batches": int(
+            train_info.get("lr_finder_mini_train_batches", 3)
+        ),
+        "lr_finder_seq_len": int(train_info.get("lr_finder_seq_len", 1024)),
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
-        "lr_finder_smith_curve_mode": train_info.get(
-            "lr_finder_smith_curve_mode", "max_decreasing"
-        ),
     }
+
+    _slow_reward_funcs = if_contain_slow_reward_function(train_info["dataset_type"])
+    if _slow_reward_funcs:
+        print(
+            "[LR Finder] Slow GRPO rewards detected: LR/batch AutoML uses **SFT CE proxy** "
+            "on tokenized JSON only (no reward imports, no rollouts). "
+            "Full training still uses your configured reward functions.",
+            flush=True,
+        )
+
+    apply_tokenized_lr_finder_to_run_config(
+        run_config,
+        train_info,
+        model_name,
+        model_path,
+        param_nums,
+        fallback_learning_rate=_lr_from_param_nums(param_nums),
+        grpo_slow_reward_proxy_probe=_slow_reward_funcs,
+    )
 
     train_request = deepcopy(train_info)
     train_request["find_lk_lr"] = True
@@ -254,7 +259,7 @@ def get_training_json(train_info: dict) -> dict:
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 250
 
-    if if_contain_slow_reward_function(train_info["dataset_type"]):
+    if _slow_reward_funcs:
         train_request["save_before_remaining_time"] = 12
         run_config["batch_size"] = _slow_reward_bs_from_param_nums(param_nums)
         run_config["max_completion_length"] = 128
@@ -263,89 +268,6 @@ def get_training_json(train_info: dict) -> dict:
             "max_completion_length=128 to shorten generation and reward cost.",
             flush=True,
         )
-
-    dataset_path = train_info.get("dataset", "")
-    dataset_type_dict = dict(train_info.get("dataset_type", {}))
-
-    grpo_train_path = train_info.get("grpo_train_path")
-    if not grpo_train_path and train_info.get("task_id"):
-        _cand = f"datasets/grpo_train_{train_info['task_id']}.json"
-        grpo_train_path = _cand if os.path.isfile(_cand) else None
-    elif grpo_train_path and not os.path.isfile(grpo_train_path):
-        grpo_train_path = None
-    if grpo_train_path:
-        dataset_type_dict["grpo_train_path"] = grpo_train_path
-
-    has_python_execution = contain_python_execution(train_info["dataset_type"])
-    max_prompt_length = int(train_info.get("max_prompt_length", 512))
-    max_completion_length = int(run_config["max_completion_length"])
-
-    if not is_dpo_grpo_lr_finder_runnable(dataset_path, grpo_train_path):
-        print(
-            "[LR Finder] Skipping: no dataset path and no grpo_train JSON; "
-            "using param-based learning rate.",
-            flush=True,
-        )
-    else:
-        _grpo_lr_kwargs = dict(
-            max_prompt_length=max_prompt_length,
-            max_completion_length=max_completion_length,
-            steps=run_config["lr_finder_steps"],
-            lr_points=run_config["lr_finder_points"],
-            optimizer_name=run_config["optimizer"],
-            smith_micro_batches=run_config["lr_finder_smith_micro_batches"],
-            smith_early_stop_divergence=run_config["lr_finder_smith_early_stop"],
-            smith_divergence_vs_min=run_config["lr_finder_smith_divergence_mult"],
-            smith_min_points_before_divergence=run_config["lr_finder_smith_min_points"],
-            lr_sample_frac=run_config["lr_finder_sample_frac"],
-            lr_sample_min=run_config["lr_finder_sample_min"],
-            lr_sample_max=run_config["lr_finder_sample_max"],
-            lr_sample_stratify=run_config["lr_finder_stratify_length"],
-            lr_sample_seed=run_config["lr_finder_sample_seed"],
-            batch_headroom=run_config["lr_finder_batch_headroom"],
-            smith_curve_mode=run_config["lr_finder_smith_curve_mode"],
-            tokenized_dataset_path=grpo_train_path,
-        )
-        if not has_python_execution:
-            lr_result = get_grpo_lr(
-                model_name,
-                model_path,
-                param_nums,
-                dataset_path,
-                dataset_type_dict,
-                **_grpo_lr_kwargs,
-            )
-        else:
-            lr_result = get_grpo_python_lr(
-                model_name,
-                model_path,
-                param_nums,
-                dataset_path,
-                dataset_type_dict,
-                **_grpo_lr_kwargs,
-            )
-
-        if lr_result is not None:
-            lr = lr_result.get("lr")
-            bs = lr_result.get("batch_size")
-
-            if lr is not None:
-                print(f"Using lr from dynamic finder: {lr}", flush=True)
-                run_config["learning_rate"] = lr
-            else:
-                fallback_lr = _lr_from_param_nums(param_nums)
-                print(f"LR finder returned no lr, using param-based fallback: {fallback_lr}", flush=True)
-                run_config["learning_rate"] = fallback_lr
-
-            if bs is not None:
-                print(f"Using batch size from dynamic finder: {bs}", flush=True)
-                run_config["batch_size"] = bs
-        else:
-            print(
-                "[LR Finder] Probe failed or errored; using param-based learning rate: "
-                f"{run_config['learning_rate']}",
-                flush=True,
-            )
 
     num_gen = run_config["num_generations"]
     bs = run_config["batch_size"]
@@ -358,7 +280,7 @@ def get_training_json(train_info: dict) -> dict:
         )
         run_config["batch_size"] = snapped
 
-    # After final batch_size (slow rewards, LR finder, num_generations snap).
+    # After final batch_size (slow rewards, num_generations snap).
     effective_gpu_nums = max(1, run_config["gpu_nums"])
     total_batch_size = run_config["batch_size"] * effective_gpu_nums
     if total_batch_size < 64:
