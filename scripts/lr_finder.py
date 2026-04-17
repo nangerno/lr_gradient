@@ -83,7 +83,10 @@ def _bf16_autocast(device: str):
 
 def _can_run(model, tokenizer, batch_size: int, seq_len: int, device: str) -> bool:
     try:
-        ids = torch.randint(0, tokenizer.vocab_size, (batch_size, seq_len)).to(device)
+        vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            vocab_size = int(len(tokenizer))
+        ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
         with _bf16_autocast(device):
             out = model(ids, labels=ids)
         out.loss.backward()
@@ -210,6 +213,10 @@ def _pick_lr_from_smith_curve(
 
     if mode == "max_decreasing":
         # Relative tolerance: tolerate tiny noise while LR increases.
+        # Require a short *streak* of rises so one noisy point does not end the zone.
+        rise_patience = 2
+        rise_streak = 0
+        rise_start_idx = -1
         raw_anchor: Optional[float] = None
         for i in range(1, len(smooth)):
             if not (np.isfinite(smooth[i]) and np.isfinite(smooth[i - 1])):
@@ -217,13 +224,21 @@ def _pick_lr_from_smith_curve(
             prev = float(smooth[i - 1])
             tol = 1e-4 * (1.0 + abs(prev))
             if float(smooth[i]) > prev + tol:
-                raw_anchor = float(lr_f[i - 1])
-                break
+                if rise_streak == 0:
+                    rise_start_idx = i
+                rise_streak += 1
+                if rise_streak >= rise_patience:
+                    # Anchor at the last LR before the sustained rise starts.
+                    raw_anchor = float(lr_f[max(0, rise_start_idx - 1)])
+                    break
+            else:
+                rise_streak = 0
+                rise_start_idx = -1
         if raw_anchor is None:
             raw_anchor = float(lr_f[-1])
             reason = "smoothed loss still decreasing at highest LR"
         else:
-            reason = "last LR before first smoothed-loss rise"
+            reason = "last LR before sustained smoothed-loss rise"
         out = _clamp(raw_anchor / smith_safety_divisor)
         print(
             f"  [LR Finder] Smith curve (max_decreasing): anchor {raw_anchor:.2e} "
@@ -316,11 +331,14 @@ def _micro_train(
     trainable = _trainable_params(model)
     model.train()
     losses: list[float] = []
+    batch_iter = _iter_batches_forever(dataloader)
 
-    for i, batch in enumerate(dataloader):
-        if i >= steps:
+    for _ in range(max(1, int(steps))):
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            # Empty dataloader: caller should handle this as unusable LR.
             break
-
         optimizer.zero_grad()
 
         texts = batch[text_key]
@@ -350,6 +368,8 @@ def _micro_train(
 
 
 def _iter_batches_forever(dataloader):
+    if len(dataloader) == 0:
+        return
     while True:
         for batch in dataloader:
             yield batch
@@ -579,9 +599,15 @@ def _pick_best_lr(
         # Return the smallest LR as the safest fallback
         return min(lr_losses.keys())
 
-    best_lr = min(finite_losses, key=finite_losses.get)
+    # Prefer the largest LR whose loss is close to the best loss.
+    # This better matches "largest stable LR" than pure argmin on noisy micro-runs.
+    best_loss = min(finite_losses.values())
+    tol = max(1e-4, 0.02 * abs(best_loss))
+    near_best = [lr for lr, loss in finite_losses.items() if loss <= best_loss + tol]
+    best_lr = max(near_best) if near_best else min(finite_losses, key=finite_losses.get)
     print(
-        f"  [LR Finder] Best LR: {best_lr:.2e}  (loss={finite_losses[best_lr]:.4f})",
+        f"  [LR Finder] Best LR: {best_lr:.2e}  "
+        f"(best_loss={best_loss:.4f}, tol=+{tol:.4f})",
         flush=True,
     )
     return best_lr
