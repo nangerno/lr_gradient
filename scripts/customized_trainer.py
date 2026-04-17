@@ -52,20 +52,33 @@ def _scalar_float(value) -> Optional[float]:
     if not math.isfinite(out):
         return None
     return out
-    
+
+
+def _latest_training_loss(state: TrainerState) -> Optional[float]:
+    """Most recent training loss from ``state.log_history``, or None if not available.
+
+    ``log_history`` can be empty early in training (e.g. before the first ``logging_steps``
+    interval), or on non-main ranks under distributed training.
+    """
+    if not state.log_history:
+        return None
+    for entry in reversed(state.log_history):
+        if not isinstance(entry, dict) or "loss" not in entry:
+            continue
+        v = entry["loss"]
+        if hasattr(v, "item"):
+            try:
+                v = v.item()
+            except Exception:
+                pass
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 class NaNSafeCallback(TrainerCallback):
-    """
-    Guards against NaN/Inf that arise when mask_truncated_completions=True and
-    every completion in a batch is truncated (completion_mask.sum() == 0).
-    TRL divides by that zero sum → NaN loss → NaN gradients.
-
-    Two-layer defence:
-      1. on_pre_optimizer_step — zero out NaN/Inf gradients before the
-         optimizer applies them, turning a poisoned step into a no-op.
-      2. on_log — replace any NaN/Inf float metric with 0.0 so logs stay
-         clean and downstream consumers (e.g. wandb) don't choke.
-    """
-
     def on_pre_optimizer_step(
         self, args, state: TrainerState, control: TrainerControl, **kwargs
     ):
@@ -183,8 +196,10 @@ class CustomEvalSaveCallback(TrainerCallback):
                 control.should_save = False
                 args.save_strategy = "no"
                 # save the current loss of this step to the state;
-                last_log = state.log_history[-1]
-                my_state["train"]["current_loss"] = last_log["loss"]
+                latest_loss = _latest_training_loss(state)
+                my_state["train"]["current_loss"] = (
+                    latest_loss if latest_loss is not None else float("nan")
+                )
                 my_state["mode"] = "continue"
                 if n > MAX_TRIES:
                     n = MAX_TRIES
@@ -202,7 +217,9 @@ class CustomEvalSaveCallback(TrainerCallback):
         elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
-            current_loss = state.log_history[-1]["loss"]
+            current_loss = _latest_training_loss(state)
+            if current_loss is None:
+                current_loss = float("nan")
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True
