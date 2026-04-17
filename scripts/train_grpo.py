@@ -7,7 +7,7 @@ import numbers
 import utility
 from datasets import Dataset
 from datetime import timezone
-from utility import log_info
+from utility import apply_save_total_limit, ensure_positive_steps_per_epoch, log_info
 from transformers import AutoTokenizer, BitsAndBytesConfig
 import transformers
 import torch
@@ -316,6 +316,7 @@ def main():
 
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
+    apply_save_total_limit(training_args, train_request)
     task_id = train_request["task_id"]
     
     # wandb_init_success = init_wandb(train_request)
@@ -345,15 +346,8 @@ def main():
     dev_ds = get_dataset(dev_path, train_request["dataset_type"])
 
     log_info(f"world_size: {training_args.world_size}")
-    total_steps_per_epoch = (
-        len(train_ds)
-        * training_args.num_generations
-        // (
-            training_args.per_device_train_batch_size
-            * training_args.gradient_accumulation_steps
-            * training_args.world_size
-        )
-    )
+    _eff_samples = len(train_ds) * int(training_args.num_generations)
+    total_steps_per_epoch = ensure_positive_steps_per_epoch(training_args, _eff_samples)
 
     log_info(f"total_steps_per_epoch: {total_steps_per_epoch}")
     # consider reducing the batch_size if it is quite big

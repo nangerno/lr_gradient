@@ -536,6 +536,27 @@ def _run_smith_with_auto_batch(
                 smith_safety_divisor=smith_safety_divisor,
                 mode=smith_curve_mode,
             )
+            # If max_decreasing clamps to min_lr, steepest descent often sits higher — use it as fallback.
+            if (
+                smith_curve_mode == "max_decreasing"
+                and lrs_out
+                and math.isclose(best_lr, min_lr, rel_tol=0.0, abs_tol=max(min_lr * 1e-9, 1e-15))
+            ):
+                steepest_lr = _pick_lr_from_smith_curve(
+                    lrs_out,
+                    losses_out,
+                    min_lr=min_lr,
+                    max_lr=max_lr,
+                    smith_safety_divisor=smith_safety_divisor,
+                    mode="steepest",
+                )
+                if steepest_lr > best_lr + max(min_lr * 1e-9, 1e-15):
+                    print(
+                        f"  [LR Finder] Primary mode hit min_lr; steepest-curve fallback "
+                        f"{steepest_lr:.2e} (was {best_lr:.2e})",
+                        flush=True,
+                    )
+                    best_lr = steepest_lr
             return best_lr, batch_size
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():

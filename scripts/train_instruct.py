@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional, Callable
 import json
 import random
-from utility import log_info, MyDataset
+from utility import apply_save_total_limit, ensure_positive_steps_per_epoch, log_info, MyDataset
 from transformers import AutoTokenizer, BitsAndBytesConfig, Trainer, TrainingArguments
 import transformers
 import torch
@@ -207,6 +207,7 @@ def main():
     (training_args, lora_args) = argument_parser.parse_args_into_dataclasses()
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
+    apply_save_total_limit(training_args, train_request)
     # log_info(f"Training request: {train_request}", "start")
     task_id = train_request["task_id"]
 
@@ -303,12 +304,6 @@ def main():
         log_info(f"dev_ds: {dev_ds.stat()}")
 
     log_info(f"world_size: {training_args.world_size}")
-    total_steps_per_epoch = len(train_ds) // (
-        training_args.per_device_train_batch_size
-        * training_args.gradient_accumulation_steps
-        * training_args.world_size
-    )
-    log_info(f"total_steps_per_epoch: {total_steps_per_epoch}")
     # consider reducing the batch_size if it is quite big
     # num_steps = len(train_ds) * training_args.num_train_epochs / (training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * training_args.world_size)
     # num_steps > min_step ->
@@ -329,13 +324,10 @@ def main():
                 f"batch_size ({training_args.per_device_train_batch_size}) is quite big, reducing it to {max_batch_size_theory}"
             )
             training_args.per_device_train_batch_size = max_batch_size_theory
-            # need to update total_steps_per_epoch
-            total_steps_per_epoch = len(train_ds) // (
-                training_args.per_device_train_batch_size
-                * training_args.gradient_accumulation_steps
-                * training_args.world_size
+            log_info(
+                f"per_device_train_batch_size set to {max_batch_size_theory} for min_steps "
+                "(total_steps_per_epoch recomputed below)"
             )
-            log_info(f"updated total_steps_per_epoch: {total_steps_per_epoch}")
 
     if training_args.use_lora:
         model = load_lora_model(training_args, train_request["model_path"], lora_args, len(tokenizer))
@@ -370,12 +362,8 @@ def main():
     if is_main_process(LOCAL_RANK):
         set_state(state)
         
-    total_steps_per_epoch = len(train_ds) // (
-                training_args.per_device_train_batch_size
-                * training_args.gradient_accumulation_steps
-                * training_args.world_size
-            )
-    
+    total_steps_per_epoch = ensure_positive_steps_per_epoch(training_args, len(train_ds))
+
     total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
     log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
     

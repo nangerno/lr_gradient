@@ -4,7 +4,7 @@ import json
 import random
 import utility
 from datasets import Dataset
-from utility import log_info
+from utility import apply_save_total_limit, ensure_positive_steps_per_epoch, log_info
 from transformers import AutoTokenizer, BitsAndBytesConfig
 from transformers.trainer_utils import get_last_checkpoint
 import transformers
@@ -127,6 +127,7 @@ def main():
     training_args, model_args = parser.parse_args_and_config()
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
+    apply_save_total_limit(training_args, train_request)
 
     # check if need to run early stop or not
     task_id = train_request["task_id"]
@@ -158,13 +159,6 @@ def main():
     dev_ds = get_dataset(dev_path, train_request["dataset_type"])
 
     log_info(f"world_size: {training_args.world_size}")
-    total_steps_per_epoch = len(train_ds) // (
-        training_args.per_device_train_batch_size
-        * training_args.gradient_accumulation_steps
-        * training_args.world_size
-    )
-
-    log_info(f"total_steps_per_epoch: {total_steps_per_epoch}")
     # consider reducing the batch_size if it is quite big
     # num_steps = len(train_ds) * training_args.num_train_epochs / (training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * training_args.world_size)
     # num_steps > min_step ->
@@ -271,12 +265,8 @@ def main():
     if is_main_process(LOCAL_RANK):
         set_state(state)
     
-    total_steps_per_epoch = len(train_ds) // (
-                training_args.per_device_train_batch_size
-                * training_args.gradient_accumulation_steps
-                * training_args.world_size
-            )
-    
+    total_steps_per_epoch = ensure_positive_steps_per_epoch(training_args, len(train_ds))
+
     total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
     log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
     
