@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import json
 import math
 import os
@@ -266,6 +267,8 @@ def _run_mini_train_lr_grid(
                 batch_size=batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
+                num_workers=0,
+                pin_memory=False,
             )
             for lr in lr_candidates:
                 _restore_trainable_weights()
@@ -280,6 +283,11 @@ def _run_mini_train_lr_grid(
                 )
                 lr_losses[lr] = avg_loss
                 print(f"    mean loss = {avg_loss:.4f}", flush=True)
+                # Mitigate host/GPU memory growth across 20+ optimizers (OOM killer often
+                # shows as ``Killed`` with no Python traceback).
+                gc.collect()
+                if device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             best_lr = _pick_lr_peak_edge_of_stability(
                 lr_losses, rel_slack=peak_rel_slack
