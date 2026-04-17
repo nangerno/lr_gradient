@@ -87,6 +87,41 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
         return None
 
 
+def _train_bundle_after_tokenize(
+    task_id: str,
+    ds_folder: str,
+    bundle: dict,
+    get_training_json_fn,
+) -> dict:
+    """
+    After ``tokenize_*.py`` has written ``datasets/train_tokenized_{task_id}.json``,
+    re-run config generation with the LR finder on that file.
+
+    Instruct/chat tasks always emit this file; DPO/GRPO tokenizers may not — if the
+    file is missing, the bundle is unchanged (param-based LR/batch).
+    """
+    tokenized_path = os.path.join(ds_folder, f"train_tokenized_{task_id}.json")
+    if not os.path.isfile(tokenized_path):
+        print(
+            "[LR Finder] Skipping probe: "
+            f"{tokenized_path} not found after tokenization (keeping param-based LR/batch).",
+            flush=True,
+        )
+        return bundle
+    req = copy.deepcopy(bundle["train_request"])
+    req["tokenized_train_path"] = tokenized_path
+    dt = req.get("dataset_type")
+    if isinstance(dt, dict):
+        dt = dict(dt)
+        dt["tokenized_train_path"] = tokenized_path
+        req["dataset_type"] = dt
+    print(
+        f"[LR Finder] Tokenized data ready; running LR/batch probe on {tokenized_path}",
+        flush=True,
+    )
+    return get_training_json_fn(req, run_lr_finder=True)
+
+
 def get_model_architecture(model_name: str) -> str:
     try:
         config = AutoConfig.from_pretrained(model_name)
@@ -437,25 +472,22 @@ def main():
         args.task_type == TaskType.INSTRUCTTEXTTASK.value
         or args.task_type == TaskType.CHATTASK.value
     ):
-        train_info = get_instruct_training_json(train_info)
+        get_training_json_fn = get_instruct_training_json
         tokenize_cmd = (
             f"/workspace/axo_py/bin/python tokenize_instruct.py {request_path}"
         )
-        train_cmd = train_info["run_cmd"]
-
     elif args.task_type == TaskType.DPOTASK.value:
-        train_info = get_dpo_training_json(train_info)
+        get_training_json_fn = get_dpo_training_json
         tokenize_cmd = f"python tokenize_dpo.py {request_path}"
-        train_cmd = train_info["run_cmd"]
-
     elif args.task_type == TaskType.GRPOTASK.value:
-        train_info = get_grpo_training_json(train_info)
+        get_training_json_fn = get_grpo_training_json
         tokenize_cmd = f"python tokenize_grpo.py {request_path}"
-        train_cmd = train_info["run_cmd"]
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
 
-    
+    # Phase 1: param-based LR/batch only — tokenized JSON does not exist yet.
+    train_info = get_training_json_fn(train_info, run_lr_finder=False)
+
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
@@ -463,6 +495,14 @@ def main():
         tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
     )
 
+    # Phase 2: LR finder on the same tokenized file training will use (instruct/chat).
+    train_info = _train_bundle_after_tokenize(
+        args.task_id, ds_folder, train_info, get_training_json_fn
+    )
+    with open(request_path, "w") as f:
+        json.dump(train_info, f, indent=4, ensure_ascii=False)
+
+    train_cmd = train_info["run_cmd"]
     original_train_cmd = train_cmd
     train_success = False
     state = {"mode": "initial"}

@@ -188,7 +188,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     return template
 
 
-def get_training_json(train_info: dict) -> dict:
+def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
     model_name = train_info["model_name"]
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
@@ -234,7 +234,7 @@ def get_training_json(train_info: dict) -> dict:
     }
 
     _slow_reward_funcs = if_contain_slow_reward_function(train_info["dataset_type"])
-    if _slow_reward_funcs:
+    if run_lr_finder and _slow_reward_funcs:
         print(
             "[LR Finder] Slow GRPO rewards detected: LR/batch AutoML uses **SFT CE proxy** "
             "on tokenized JSON only (no reward imports, no rollouts). "
@@ -242,15 +242,16 @@ def get_training_json(train_info: dict) -> dict:
             flush=True,
         )
 
-    apply_tokenized_lr_finder_to_run_config(
-        run_config,
-        train_info,
-        model_name,
-        model_path,
-        param_nums,
-        fallback_learning_rate=_lr_from_param_nums(param_nums),
-        grpo_slow_reward_proxy_probe=_slow_reward_funcs,
-    )
+    if run_lr_finder:
+        apply_tokenized_lr_finder_to_run_config(
+            run_config,
+            train_info,
+            model_name,
+            model_path,
+            param_nums,
+            fallback_learning_rate=_lr_from_param_nums(param_nums),
+            grpo_slow_reward_proxy_probe=_slow_reward_funcs,
+        )
 
     train_request = deepcopy(train_info)
     train_request["find_lk_lr"] = True

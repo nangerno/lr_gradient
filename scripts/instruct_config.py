@@ -117,7 +117,7 @@ def _lr_from_param_nums(param_nums) -> float:
     return 3e-6                
 
 
-def get_training_json(train_info: dict) -> dict:
+def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
     model_name = train_info["model_name"]
     model_path = train_info["model_path"]
 
@@ -161,14 +161,15 @@ def get_training_json(train_info: dict) -> dict:
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
     }
 
-    apply_tokenized_lr_finder_to_run_config(
-        run_config,
-        train_info,
-        model_name,
-        model_path,
-        param_nums,
-        fallback_learning_rate=_lr_from_param_nums(param_nums),
-    )
+    if run_lr_finder:
+        apply_tokenized_lr_finder_to_run_config(
+            run_config,
+            train_info,
+            model_name,
+            model_path,
+            param_nums,
+            fallback_learning_rate=_lr_from_param_nums(param_nums),
+        )
 
     # Keep scheduling math safe even when GPU auto-detection fails.
     effective_gpu_nums = max(1, run_config["gpu_nums"])
