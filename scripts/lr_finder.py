@@ -84,6 +84,7 @@ def find_max_batch_size(
     device: str = "cuda",
     *,
     headroom: float = 0.8,
+    b_train_cap: Optional[int] = None,
 ) -> tuple[int, int]:
     if not _can_run(model, tokenizer, 1, seq_len, device):
         # Avoid low=0 in binary search; real-data path in LR finder retries with smaller batch.
@@ -107,6 +108,8 @@ def find_max_batch_size(
     b_max = max(1, int(best))
     hr = headroom if 0 < headroom <= 1.0 else 0.8
     b_train = max(1, int(b_max * hr))
+    if b_train_cap is not None and b_train_cap > 0:
+        b_train = min(b_train, int(b_train_cap))
     return b_max, b_train
 
 
@@ -212,24 +215,30 @@ def _mini_train_mean_loss(
 ) -> float:
     """Run ``num_batches`` optimizer steps at ``lr``; return mean loss (tokenized batches only)."""
     optimizer = _make_optimizer(model, lr, optimizer_name)
-    trainable = _trainable_params(model)
-    model.train()
-    losses: list[float] = []
-    batch_iter = _iter_batches_forever(dataloader)
-    for _ in range(max(1, int(num_batches))):
-        batch = next(batch_iter)
-        inputs = {k: v.to(device) for k, v in batch.items()}
-        optimizer.zero_grad()
-        with _bf16_autocast(device):
-            # Batch already includes ``labels``; do not pass ``labels=`` again (TypeError).
-            loss = model(**inputs).loss
-        if not torch.isfinite(loss):
-            return float("inf")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-        optimizer.step()
-        losses.append(loss.item())
-    return float(np.mean(losses)) if losses else float("inf")
+    try:
+        trainable = _trainable_params(model)
+        model.train()
+        losses: list[float] = []
+        batch_iter = _iter_batches_forever(dataloader)
+        for _ in range(max(1, int(num_batches))):
+            batch = next(batch_iter)
+            inputs = {k: v.to(device) for k, v in batch.items()}
+            optimizer.zero_grad()
+            with _bf16_autocast(device):
+                # Batch already includes ``labels``; do not pass ``labels=`` again (TypeError).
+                loss = model(**inputs).loss
+            if not torch.isfinite(loss):
+                return float("inf")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            optimizer.step()
+            losses.append(loss.item())
+        return float(np.mean(losses)) if losses else float("inf")
+    finally:
+        del optimizer
+        gc.collect()
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _run_mini_train_lr_grid(
@@ -244,73 +253,114 @@ def _run_mini_train_lr_grid(
     peak_rel_slack: float,
     collate_fn: Optional[Callable] = None,
 ) -> tuple[float, int]:
-    trainable_snapshot = {
-        name: param.detach().clone()
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    }
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    with torch.no_grad():
+        cpu_snapshot = {n: p.detach().cpu().clone() for n, p in trainable}
 
     def _restore_trainable_weights() -> None:
-        for name, param in model.named_parameters():
-            if name in trainable_snapshot:
-                param.data.copy_(trainable_snapshot[name])
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in cpu_snapshot:
+                    param.copy_(
+                        cpu_snapshot[name].to(
+                            device=param.device,
+                            dtype=param.dtype,
+                            non_blocking=True,
+                        )
+                    )
         model.zero_grad(set_to_none=True)
+        gc.collect()
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     start_batch = max(1, safe_batch)
     batch_size = start_batch
 
-    while batch_size >= 1:
-        try:
-            lr_losses: dict[float, float] = {}
-            dl = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                collate_fn=collate_fn,
-                num_workers=0,
-                pin_memory=False,
-            )
-            for lr in lr_candidates:
-                _restore_trainable_weights()
-                print(f"  [LR Finder] mini-train probe LR={lr:.2e} …", flush=True)
-                avg_loss = _mini_train_mean_loss(
-                    model,
-                    dl,
-                    lr,
-                    device,
-                    optimizer_name,
-                    num_batches=mini_train_batches,
+    try:
+        while batch_size >= 1:
+            try:
+                lr_losses: dict[float, float] = {}
+                dl = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    collate_fn=collate_fn,
+                    num_workers=0,
+                    pin_memory=False,
                 )
-                lr_losses[lr] = avg_loss
-                print(f"    mean loss = {avg_loss:.4f}", flush=True)
-                # Mitigate host/GPU memory growth across 20+ optimizers (OOM killer often
-                # shows as ``Killed`` with no Python traceback).
-                gc.collect()
-                if device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                for lr in lr_candidates:
+                    _restore_trainable_weights()
+                    print(f"  [LR Finder] mini-train probe LR={lr:.2e} …", flush=True)
+                    try:
+                        avg_loss = _mini_train_mean_loss(
+                            model,
+                            dl,
+                            lr,
+                            device,
+                            optimizer_name,
+                            num_batches=mini_train_batches,
+                        )
+                        lr_losses[lr] = avg_loss
+                        print(f"    mean loss = {avg_loss:.4f}", flush=True)
+                    except RuntimeError as exc:
+                        if "out of memory" in str(exc).lower():
+                            lr_losses[lr] = float("inf")
+                            print(
+                                f"    [LR Finder] OOM at LR={lr:.2e}; "
+                                "marking invalid, clearing cache, continuing.",
+                                flush=True,
+                            )
+                            _restore_trainable_weights()
+                            gc.collect()
+                            if device == "cuda" and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        raise
+                    gc.collect()
+                    if device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
 
-            best_lr = _pick_lr_peak_edge_of_stability(
-                lr_losses, rel_slack=peak_rel_slack
-            )
-            print(f"  [LR Finder] selected LR from mini-train grid: {best_lr:.2e}", flush=True)
-            return best_lr, batch_size
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower():
+                best_lr = _pick_lr_peak_edge_of_stability(
+                    lr_losses, rel_slack=peak_rel_slack
+                )
                 print(
-                    f"  [LR Finder] OOM at batch_size={batch_size}, halving …",
+                    f"  [LR Finder] selected LR from mini-train grid: {best_lr:.2e}",
                     flush=True,
                 )
-                batch_size //= 2
-                torch.cuda.empty_cache()
-            else:
-                raise
+                return best_lr, batch_size
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    print(
+                        f"  [LR Finder] OOM at batch_size={batch_size}, halving …",
+                        flush=True,
+                    )
+                    batch_size //= 2
+                    torch.cuda.empty_cache()
+                else:
+                    raise
 
-    raise RuntimeError("Even batch_size=1 does not fit in GPU memory.")
+        raise RuntimeError("Even batch_size=1 does not fit in GPU memory.")
+    finally:
+        del cpu_snapshot
+        gc.collect()
 
 
 # --------------------------------------------------------------------------- #
 # Dataset loading — 2% of tokenized instruct JSON
 # --------------------------------------------------------------------------- #
+
+def _lr_finder_tight_headroom_after_kill(dataset_type_dict: dict) -> bool:
+    """0.6 headroom when resubmitting after OOM kill (tournaments): env or train_request flag."""
+    env = os.environ.get("LR_FINDER_TIGHT_BATCH_HEADROOM", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return _config_bool_or_default(
+        dataset_type_dict.get("lr_finder_tight_after_job_kill"),
+        False,
+    )
+
 
 def _config_bool_or_default(value, default: bool) -> bool:
     """Parse booleans from JSON/YAML; treat ``None`` as *use default*."""
@@ -520,7 +570,7 @@ def find_lr(
     min_lr: float = 1e-6,
     max_lr: float = 9e-3,
     lr_probe_points: int = 28,
-    mini_train_batches: int = 3,
+    mini_train_batches: int = 1,
     seq_len: int = 1024,
     lora_threshold: Optional[int] = None,
     lora_r: int = _DEFAULT_LORA_R,
@@ -566,6 +616,13 @@ def find_lr(
         if _proxy_grpo
         else "tokenized_SFT_CE"
     )
+    _probe_seq_cfg = dataset_type_dict.get("lr_finder_probe_seq_len")
+    try:
+        _probe_cap = int(_probe_seq_cfg) if _probe_seq_cfg is not None else 1024
+    except (TypeError, ValueError):
+        _probe_cap = 1024
+    _probe_cap = max(1, _probe_cap)
+
     print(
         f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
@@ -625,18 +682,55 @@ def find_lr(
         model.gradient_checkpointing_enable()
 
         # ------------------------------------------------------------------ #
-        # Find B_max (synthetic), then B_train = headroom × B_max (default 0.8).
+        # Probe seq cap: synthetic search + collate pad to min(train seq, lr_finder_probe_seq_len).
         # ------------------------------------------------------------------ #
-        _hr = float(
-            dataset_type_dict.get("lr_finder_batch_headroom", batch_headroom)
-        )
+        effective_probe_seq = max(1, min(int(seq_len), _probe_cap))
+        if effective_probe_seq < int(seq_len):
+            print(
+                f"[LR Finder] Probe sequence length capped: train_seq_len={seq_len} → "
+                f"probe_seq_len={effective_probe_seq} (lr_finder_probe_seq_len={_probe_cap})",
+                flush=True,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Find B_max (synthetic), then B_train = headroom × B_max (default 0.8).
+        # Use 0.6 only when retrying after a killed job (OOM): see _lr_finder_tight_headroom_after_kill.
+        # ------------------------------------------------------------------ #
+        _base_hr = float(dataset_type_dict.get("lr_finder_batch_headroom", batch_headroom))
+        if _lr_finder_tight_headroom_after_kill(dataset_type_dict):
+            _hr = 0.6
+            print(
+                "[LR Finder] Tight batch headroom 0.6 (post-kill retry: "
+                "lr_finder_tight_after_job_kill or LR_FINDER_TIGHT_BATCH_HEADROOM=1).",
+                flush=True,
+            )
+        else:
+            _hr = _base_hr
         _hr = _hr if 0 < _hr <= 1.0 else 0.8
-        print("[LR Finder] Probing max batch size (synthetic seq_len) …", flush=True)
-        b_max, b_train = find_max_batch_size(
-            model, tokenizer, seq_len=seq_len, device=device, headroom=_hr
-        )
+        _bcap_raw = dataset_type_dict.get("lr_finder_b_train_cap", 4)
+        try:
+            _b_train_cap = int(_bcap_raw) if _bcap_raw is not None else 4
+        except (TypeError, ValueError):
+            _b_train_cap = 4
+        if _b_train_cap <= 0:
+            _b_train_cap = None
         print(
-            f"[LR Finder] B_max={b_max}  B_train={b_train}  (headroom={_hr:g}× for stability)",
+            "[LR Finder] Probing max batch size (synthetic seq_len=probe) …",
+            flush=True,
+        )
+        b_max, b_train = find_max_batch_size(
+            model,
+            tokenizer,
+            seq_len=effective_probe_seq,
+            device=device,
+            headroom=_hr,
+            b_train_cap=_b_train_cap,
+        )
+        _bmsg = f"headroom={_hr:g}"
+        if _b_train_cap:
+            _bmsg += f"  B_train_cap={_b_train_cap}"
+        print(
+            f"[LR Finder] B_max={b_max}  B_train={b_train}  ({_bmsg})",
             flush=True,
         )
         safe_batch = b_train
@@ -665,11 +759,11 @@ def find_lr(
             target_tokens_min=max(0, _tok_min),
             target_tokens_max=max(_tok_min, _tok_max),
         )
-        collate_fn = _make_tokenized_collate_fn(tokenizer, seq_len)
+        collate_fn = _make_tokenized_collate_fn(tokenizer, effective_probe_seq)
         print(
             f"[LR Finder] Probe rows: {len(sample_ds)}  ~{probe_tokens} tokens  "
             f"(floor=max({_min_rows},{_probe_frac:g}·N), target {_tok_min}–{_tok_max} tok; "
-            f"stratify={_strat})",
+            f"stratify={_strat}; pad/collate_seq_len={effective_probe_seq})",
             flush=True,
         )
 

@@ -225,12 +225,17 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             )
         ),
         "lr_finder_mini_train_batches": int(
-            train_info.get("lr_finder_mini_train_batches", 3)
+            train_info.get("lr_finder_mini_train_batches", 2)
         ),
         "lr_finder_seq_len": effective_lr_finder_seq_len(train_info),
+        "lr_finder_probe_seq_len": int(train_info.get("lr_finder_probe_seq_len", 1024)),
+        "lr_finder_b_train_cap": int(train_info.get("lr_finder_b_train_cap", 4)),
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
+        "lr_finder_tight_after_job_kill": bool(
+            train_info.get("lr_finder_tight_after_job_kill", False)
+        ),
         "lr_finder_peak_rel_slack": float(train_info.get("lr_finder_peak_rel_slack", 0.28)),
         "lr_finder_min_probe_rows": int(train_info.get("lr_finder_min_probe_rows", 32)),
         "lr_finder_probe_fraction": float(train_info.get("lr_finder_probe_fraction", 0.02)),

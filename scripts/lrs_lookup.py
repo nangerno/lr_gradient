@@ -58,6 +58,17 @@ def apply_tokenized_lr_finder_to_run_config(
     dataset_type_dict["lr_finder_target_tokens_max"] = int(
         run_config.get("lr_finder_target_tokens_max", 200_000)
     )
+    dataset_type_dict["lr_finder_probe_seq_len"] = int(
+        run_config.get("lr_finder_probe_seq_len", 1024)
+    )
+    _bcap = run_config.get("lr_finder_b_train_cap", 4)
+    try:
+        dataset_type_dict["lr_finder_b_train_cap"] = int(_bcap) if _bcap is not None else 4
+    except (TypeError, ValueError):
+        dataset_type_dict["lr_finder_b_train_cap"] = 4
+    dataset_type_dict["lr_finder_tight_after_job_kill"] = bool(
+        run_config.get("lr_finder_tight_after_job_kill", False)
+    )
 
     if not is_instruct_lr_finder_runnable(tokenized_train_path):
         print(
@@ -126,7 +137,7 @@ def get_instruct_lr(
     tokenized_dataset_path: str,
     seq_len: int = 1024,
     lr_probe_points: int = 28,
-    mini_train_batches: int = 3,
+    mini_train_batches: int = 2,
     optimizer_name: Optional[str] = None,
     lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
