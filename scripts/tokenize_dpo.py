@@ -161,6 +161,11 @@ def main(training_request_path: str):
     model_name = training_request["train_request"]["model_name"]
     
     split_dataset(total_path, train_path, dev_path, max_data_size=max_data_size, model=model_name)
+
+    from lr_probe_tokenized_export import export_dpo_train_tokenized_for_lr_probe
+
+    export_dpo_train_tokenized_for_lr_probe(training_request)
+
     t2 = datetime.now()
     print(f"Tokenization completed in {(t2 - t1).seconds} seconds")
 

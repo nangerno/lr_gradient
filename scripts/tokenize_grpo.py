@@ -84,6 +84,11 @@ def main(training_request_path: str):
     train_path = os.path.join("datasets", f"grpo_train_{task_id}.json")
     dev_path = os.path.join("datasets", f"grpo_dev_{task_id}.json")
     split_dataset(total_path, train_path, dev_path)
+
+    from lr_probe_tokenized_export import export_grpo_train_tokenized_for_lr_probe
+
+    export_grpo_train_tokenized_for_lr_probe(training_request)
+
     t2 = datetime.now()
     print(f"Tokenization completed in {(t2 - t1).seconds} seconds")
 
