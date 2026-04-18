@@ -225,7 +225,7 @@ def _mini_train_mean_loss(
     num_batches: int,
     probe_use_sgd: bool = False,
 ) -> float:
-    """Run ``num_batches`` optimizer steps at ``lr``; return mean loss (tokenized batches only)."""
+    """Run ``num_batches`` optimizer steps at ``lr``; return mean **post-update** loss per batch."""
     optimizer = _make_optimizer(
         model, lr, optimizer_name, probe_use_sgd=probe_use_sgd
     )
@@ -246,7 +246,16 @@ def _mini_train_mean_loss(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
             optimizer.step()
-            losses.append(loss.item())
+            # Must measure loss *after* the step; pre-step loss is identical for every LR when
+            # weights are restored each time (mini_train_batches=1 looked like a flat 1.76… grid).
+            model.eval()
+            with torch.no_grad():
+                with _bf16_autocast(device):
+                    loss_after = model(**inputs).loss
+            model.train()
+            if not torch.isfinite(loss_after):
+                return float("inf")
+            losses.append(loss_after.item())
         return float(np.mean(losses)) if losses else float("inf")
     finally:
         del optimizer
