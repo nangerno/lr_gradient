@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import tempfile
 from typing import Callable, Optional
 
 import numpy as np
@@ -29,6 +30,9 @@ _DEFAULT_LORA_THRESHOLD = 4_000_000_000
 _DEFAULT_LORA_R = 8
 _DEFAULT_LORA_ALPHA = 16
 _DEFAULT_LORA_DROPOUT = 0.05
+
+# Full fine-tune: keep snapshot on disk instead of a permanent ~model-size CPU dict (host OOM).
+_SNAPSHOT_DISK_THRESHOLD_BYTES = 256 * 1024 * 1024
 
 # --------------------------------------------------------------------------- #
 # LoRA helpers
@@ -173,9 +177,16 @@ def _make_optimizer(
     lr: float,
     optimizer_name: Optional[str],
     weight_decay: float = 0.0,
+    *,
+    probe_use_sgd: bool = False,
 ):
-    """Match training optim when possible; fall back to AdamW on trainable params only."""
+    """
+    Training optim when possible. For the LR **probe** only, optional SGD avoids Adam/8bit
+    state + bitsandbytes paging (major source of host RAM and OOM-killer ``Killed`` on 8B FT).
+    """
     params = _trainable_params(model)
+    if probe_use_sgd:
+        return torch.optim.SGD(params, lr=lr, momentum=0.0, weight_decay=weight_decay)
     key = (optimizer_name or "adamw_torch").lower().replace("-", "_")
     if key in ("paged_adamw_8bit", "pagedadamw8bit"):
         try:
@@ -212,9 +223,12 @@ def _mini_train_mean_loss(
     optimizer_name: Optional[str],
     *,
     num_batches: int,
+    probe_use_sgd: bool = False,
 ) -> float:
     """Run ``num_batches`` optimizer steps at ``lr``; return mean loss (tokenized batches only)."""
-    optimizer = _make_optimizer(model, lr, optimizer_name)
+    optimizer = _make_optimizer(
+        model, lr, optimizer_name, probe_use_sgd=probe_use_sgd
+    )
     try:
         trainable = _trainable_params(model)
         model.train()
@@ -241,6 +255,13 @@ def _mini_train_mean_loss(
             torch.cuda.empty_cache()
 
 
+def _load_trainable_checkpoint(path: str) -> dict:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def _run_mini_train_lr_grid(
     model,
     dataset: Dataset,
@@ -252,22 +273,56 @@ def _run_mini_train_lr_grid(
     mini_train_batches: int,
     peak_rel_slack: float,
     collate_fn: Optional[Callable] = None,
+    probe_use_sgd: bool = False,
 ) -> tuple[float, int]:
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    with torch.no_grad():
-        cpu_snapshot = {n: p.detach().cpu().clone() for n, p in trainable}
+    total_trainable_bytes = sum(p.numel() * p.element_size() for _, p in trainable)
+
+    ckpt_path: Optional[str] = None
+    cpu_snapshot: Optional[dict[str, torch.Tensor]] = None
+
+    if total_trainable_bytes > _SNAPSHOT_DISK_THRESHOLD_BYTES:
+        fd, ckpt_path = tempfile.mkstemp(prefix="lr_finder_w_", suffix=".pt")
+        os.close(fd)
+        with torch.no_grad():
+            torch.save({n: p.detach().cpu() for n, p in trainable}, ckpt_path)
+        gc.collect()
+        print(
+            f"[LR Finder] Trainable weights ≈{total_trainable_bytes / 1e9:.2f} GB → "
+            f"disk snapshot (saves host RAM vs. keeping a full CPU copy): {ckpt_path}",
+            flush=True,
+        )
+    else:
+        with torch.no_grad():
+            cpu_snapshot = {n: p.detach().cpu().clone() for n, p in trainable}
 
     def _restore_trainable_weights() -> None:
         with torch.no_grad():
-            for name, param in model.named_parameters():
-                if name in cpu_snapshot:
-                    param.copy_(
-                        cpu_snapshot[name].to(
-                            device=param.device,
-                            dtype=param.dtype,
-                            non_blocking=True,
+            if ckpt_path is not None:
+                blob = _load_trainable_checkpoint(ckpt_path)
+                try:
+                    for name, param in model.named_parameters():
+                        if name in blob:
+                            param.copy_(
+                                blob[name].to(
+                                    device=param.device,
+                                    dtype=param.dtype,
+                                    non_blocking=True,
+                                )
+                            )
+                finally:
+                    del blob
+            else:
+                assert cpu_snapshot is not None
+                for name, param in model.named_parameters():
+                    if name in cpu_snapshot:
+                        param.copy_(
+                            cpu_snapshot[name].to(
+                                device=param.device,
+                                dtype=param.dtype,
+                                non_blocking=True,
+                            )
                         )
-                    )
         model.zero_grad(set_to_none=True)
         gc.collect()
         if device == "cuda" and torch.cuda.is_available():
@@ -300,6 +355,7 @@ def _run_mini_train_lr_grid(
                             device,
                             optimizer_name,
                             num_batches=mini_train_batches,
+                            probe_use_sgd=probe_use_sgd,
                         )
                         lr_losses[lr] = avg_loss
                         print(f"    mean loss = {avg_loss:.4f}", flush=True)
@@ -343,7 +399,13 @@ def _run_mini_train_lr_grid(
 
         raise RuntimeError("Even batch_size=1 does not fit in GPU memory.")
     finally:
-        del cpu_snapshot
+        if cpu_snapshot is not None:
+            del cpu_snapshot
+        if ckpt_path is not None:
+            try:
+                os.remove(ckpt_path)
+            except OSError:
+                pass
         gc.collect()
 
 
@@ -618,10 +680,15 @@ def find_lr(
     )
     _probe_seq_cfg = dataset_type_dict.get("lr_finder_probe_seq_len")
     try:
-        _probe_cap = int(_probe_seq_cfg) if _probe_seq_cfg is not None else 1024
+        _probe_cap = int(_probe_seq_cfg) if _probe_seq_cfg is not None else 512
     except (TypeError, ValueError):
-        _probe_cap = 1024
+        _probe_cap = 512
     _probe_cap = max(1, _probe_cap)
+
+    _probe_sgd = _config_bool_or_default(
+        dataset_type_dict.get("lr_finder_probe_sgd"),
+        True,
+    )
 
     print(
         f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
@@ -631,6 +698,18 @@ def find_lr(
         + f"  peak_rel_slack={_peak_sl:g}",
         flush=True,
     )
+    if _probe_sgd:
+        print(
+            "[LR Finder] Probe optimizer: **SGD** (no Adam / 8-bit optimizer state; saves RAM). "
+            "Training still uses your configured optimizer. "
+            "Set lr_finder_probe_sgd=false to run the training optimizer inside the probe (higher memory).",
+            flush=True,
+        )
+    else:
+        print(
+            f"[LR Finder] Probe optimizer matches training ({_opt_disp}) — higher memory use.",
+            flush=True,
+        )
     if _proxy_grpo:
         print(
             "[LR Finder] GRPO slow-reward task: this probe uses **SFT cross-entropy only** "
@@ -786,6 +865,7 @@ def find_lr(
             mini_train_batches=_mini_b,
             peak_rel_slack=_peak_sl,
             collate_fn=collate_fn,
+            probe_use_sgd=_probe_sgd,
         )
 
         train_batch = min(b_train, probe_batch)

@@ -170,11 +170,12 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             )
         ),
         "lr_finder_mini_train_batches": int(
-            train_info.get("lr_finder_mini_train_batches", 2)
+            train_info.get("lr_finder_mini_train_batches", 1)
         ),
         "lr_finder_seq_len": effective_lr_finder_seq_len(train_info),
-        "lr_finder_probe_seq_len": int(train_info.get("lr_finder_probe_seq_len", 1024)),
-        "lr_finder_b_train_cap": int(train_info.get("lr_finder_b_train_cap", 4)),
+        "lr_finder_probe_seq_len": int(train_info.get("lr_finder_probe_seq_len", 512)),
+        "lr_finder_b_train_cap": int(train_info.get("lr_finder_b_train_cap", 2)),
+        "lr_finder_probe_sgd": bool(train_info.get("lr_finder_probe_sgd", True)),
         "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
