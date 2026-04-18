@@ -177,16 +177,9 @@ def _make_optimizer(
     lr: float,
     optimizer_name: Optional[str],
     weight_decay: float = 0.0,
-    *,
-    probe_use_sgd: bool = False,
 ):
-    """
-    Training optim when possible. For the LR **probe** only, optional SGD avoids Adam/8bit
-    state + bitsandbytes paging (major source of host RAM and OOM-killer ``Killed`` on 8B FT).
-    """
+    """AdamW (or PagedAdamW8bit when training uses it)."""
     params = _trainable_params(model)
-    if probe_use_sgd:
-        return torch.optim.SGD(params, lr=lr, momentum=0.0, weight_decay=weight_decay)
     key = (optimizer_name or "adamw_torch").lower().replace("-", "_")
     if key in ("paged_adamw_8bit", "pagedadamw8bit"):
         try:
@@ -223,12 +216,9 @@ def _mini_train_mean_loss(
     optimizer_name: Optional[str],
     *,
     num_batches: int,
-    probe_use_sgd: bool = False,
 ) -> float:
     """Run ``num_batches`` optimizer steps at ``lr``; return mean **post-update** loss per batch."""
-    optimizer = _make_optimizer(
-        model, lr, optimizer_name, probe_use_sgd=probe_use_sgd
-    )
+    optimizer = _make_optimizer(model, lr, optimizer_name)
     try:
         trainable = _trainable_params(model)
         model.train()
@@ -282,7 +272,6 @@ def _run_mini_train_lr_grid(
     mini_train_batches: int,
     peak_rel_slack: float,
     collate_fn: Optional[Callable] = None,
-    probe_use_sgd: bool = False,
 ) -> tuple[float, int]:
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     total_trainable_bytes = sum(p.numel() * p.element_size() for _, p in trainable)
@@ -364,7 +353,6 @@ def _run_mini_train_lr_grid(
                             device,
                             optimizer_name,
                             num_batches=mini_train_batches,
-                            probe_use_sgd=probe_use_sgd,
                         )
                         lr_losses[lr] = avg_loss
                         print(f"    mean loss = {avg_loss:.4f}", flush=True)
@@ -694,11 +682,6 @@ def find_lr(
         _probe_cap = 512
     _probe_cap = max(1, _probe_cap)
 
-    _probe_sgd = _config_bool_or_default(
-        dataset_type_dict.get("lr_finder_probe_sgd"),
-        True,
-    )
-
     print(
         f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
         + (f"  lora_r={lora_r}" if use_lora else "")
@@ -707,18 +690,6 @@ def find_lr(
         + f"  peak_rel_slack={_peak_sl:g}",
         flush=True,
     )
-    if _probe_sgd:
-        print(
-            "[LR Finder] Probe optimizer: **SGD** (no Adam / 8-bit optimizer state; saves RAM). "
-            "Training still uses your configured optimizer. "
-            "Set lr_finder_probe_sgd=false to run the training optimizer inside the probe (higher memory).",
-            flush=True,
-        )
-    else:
-        print(
-            f"[LR Finder] Probe optimizer matches training ({_opt_disp}) — higher memory use.",
-            flush=True,
-        )
     if _proxy_grpo:
         print(
             "[LR Finder] GRPO slow-reward task: this probe uses **SFT cross-entropy only** "
@@ -874,7 +845,6 @@ def find_lr(
             mini_train_batches=_mini_b,
             peak_rel_slack=_peak_sl,
             collate_fn=collate_fn,
-            probe_use_sgd=_probe_sgd,
         )
 
         train_batch = min(b_train, probe_batch)

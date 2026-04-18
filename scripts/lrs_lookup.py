@@ -69,9 +69,6 @@ def apply_tokenized_lr_finder_to_run_config(
     dataset_type_dict["lr_finder_tight_after_job_kill"] = bool(
         run_config.get("lr_finder_tight_after_job_kill", False)
     )
-    dataset_type_dict["lr_finder_probe_sgd"] = bool(
-        run_config.get("lr_finder_probe_sgd", True)
-    )
 
     if not is_instruct_lr_finder_runnable(tokenized_train_path):
         print(
