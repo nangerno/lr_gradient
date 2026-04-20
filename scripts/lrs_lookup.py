@@ -69,6 +69,12 @@ def apply_tokenized_lr_finder_to_run_config(
     dataset_type_dict["lr_finder_tight_after_job_kill"] = bool(
         run_config.get("lr_finder_tight_after_job_kill", False)
     )
+    try:
+        _qis = run_config.get("lr_finder_quadratic_interp_steps", 10)
+        _qis_i = int(_qis) if _qis is not None else 10
+    except (TypeError, ValueError):
+        _qis_i = 10
+    dataset_type_dict["lr_finder_quadratic_interp_steps"] = max(0, _qis_i)
 
     if not is_instruct_lr_finder_runnable(tokenized_train_path):
         print(

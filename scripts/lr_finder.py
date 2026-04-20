@@ -164,6 +164,120 @@ def _pick_lr_peak_edge_of_stability(
     return min(finite, key=lambda x: x[1])[0]
 
 
+def _env_flag(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _local_window_quadratic_log_lr_fit(
+    lrs: np.ndarray,
+    losses: np.ndarray,
+    *,
+    half_window: int = 2,
+) -> Optional[tuple[np.ndarray, int, int, Optional[float]]]:
+    """
+    Fit loss ≈ a·(log lr)² + b·log lr + c on a local window around the empirical loss minimum.
+    Returns ``(coeffs, lo, hi, lr_vertex)`` when the fit is convex (a > 0).
+    ``lr_vertex`` is the analytical minimum exp(-b/2a) only if it lies inside the window's
+    log-LR interval; otherwise ``None`` (refinement mini-train can still use the window).
+    """
+    n = int(lrs.shape[0])
+    if n < 3:
+        return None
+    i_min = int(np.argmin(losses))
+    lo = max(0, i_min - half_window)
+    hi = min(n, i_min + half_window + 1)
+    if hi - lo < 3:
+        lo = max(0, n - 3)
+        hi = n
+    t = np.ascontiguousarray(np.log(lrs[lo:hi]), dtype=np.float64)
+    y = np.ascontiguousarray(losses[lo:hi], dtype=np.float64)
+    if t.shape[0] < 3:
+        return None
+    try:
+        coeffs = np.polyfit(t, y, 2, rcond=1e-7)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+    a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+    if not all(math.isfinite(x) for x in (a, b, c)):
+        return None
+    if a <= 1e-14:
+        return None
+    t_star = -b / (2.0 * a)
+    t_lo = float(np.log(lrs[lo]))
+    t_hi = float(np.log(lrs[hi - 1]))
+    lr_vertex: Optional[float] = None
+    if t_lo <= t_star <= t_hi:
+        lr_v = math.exp(t_star)
+        if math.isfinite(lr_v) and lr_v > 0:
+            lr_vertex = lr_v
+    return coeffs, lo, hi, lr_vertex
+
+
+def _print_quadratic_interp_table(
+    coeffs: np.ndarray,
+    lr_lo: float,
+    lr_hi: float,
+    *,
+    steps: int,
+    lr_mark: float,
+) -> None:
+    """Log estimated loss along the fitted parabola (log-spaced LR between lr_lo and lr_hi)."""
+    if steps < 2:
+        return
+    a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+    t_lo = math.log(lr_lo)
+    t_hi = math.log(lr_hi)
+    print(
+        f"  [LR Finder] quadratic fit on log(lr): loss ≈ {a:.4g}·t² + {b:.4g}·t + {c:.4g}  "
+        f"(t = log lr), convex (a>0)",
+        flush=True,
+    )
+    print(
+        f"  [LR Finder] interpolated loss along fit ({steps} points between {lr_lo:.2e} and {lr_hi:.2e}):",
+        flush=True,
+    )
+    rows: list[tuple[float, float, float]] = []
+    for i in range(steps):
+        frac = i / (steps - 1) if steps > 1 else 0.0
+        t = t_lo + frac * (t_hi - t_lo)
+        lr = math.exp(t)
+        est = a * t * t + b * t + c
+        rows.append(
+            (lr, est, abs(math.log(max(lr, 1e-300)) - math.log(max(lr_mark, 1e-300))))
+        )
+    j_star = min(range(len(rows)), key=lambda k: rows[k][2])
+    for j, (lr, est, _) in enumerate(rows):
+        mark = "  [closest to vertex]" if j == j_star else ""
+        print(f"    lr={lr:.2e}  est_loss={est:.4f}{mark}", flush=True)
+
+
+def _effective_quadratic_interp_steps(default: int) -> int:
+    env_steps = os.environ.get("LR_FINDER_INTERP_STEPS", "").strip()
+    if env_steps:
+        try:
+            return max(0, int(env_steps))
+        except ValueError:
+            pass
+    return max(0, default)
+
+
+def _log_uniform_lrs(lr_lo: float, lr_hi: float, steps: int) -> list[float]:
+    """``steps`` LRs evenly spaced in log-space between ``lr_lo`` and ``lr_hi`` (inclusive)."""
+    if steps < 2:
+        return [lr_lo]
+    lo = min(lr_lo, lr_hi)
+    hi = max(lr_lo, lr_hi)
+    t_lo = math.log(lo)
+    t_hi = math.log(hi)
+    out: list[float] = []
+    for i in range(steps):
+        frac = i / (steps - 1) if steps > 1 else 0.0
+        t = t_lo + frac * (t_hi - t_lo)
+        out.append(math.exp(t))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Micro-training kernels
 # --------------------------------------------------------------------------- #
@@ -271,6 +385,7 @@ def _run_mini_train_lr_grid(
     *,
     mini_train_batches: int,
     peak_rel_slack: float,
+    quadratic_interp_steps: int = 10,
     collate_fn: Optional[Callable] = None,
 ) -> tuple[float, int]:
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
@@ -375,12 +490,144 @@ def _run_mini_train_lr_grid(
                         torch.cuda.synchronize()
                         torch.cuda.empty_cache()
 
+                # --- LR selection: convex quadratic window + optional refinement mini-train ---
+                finite_pairs = [
+                    (lr, loss) for lr, loss in lr_losses.items() if math.isfinite(loss)
+                ]
+                if not finite_pairs:
+                    return min(lr_losses.keys()), batch_size
+                finite_pairs.sort(key=lambda x: x[0])
+                lrs_arr = np.array([x[0] for x in finite_pairs], dtype=np.float64)
+                losses_arr = np.array([x[1] for x in finite_pairs], dtype=np.float64)
+
+                if _env_flag("LR_FINDER_USE_PEAK_RULE_ONLY"):
+                    best_lr = _pick_lr_peak_edge_of_stability(
+                        lr_losses, rel_slack=peak_rel_slack
+                    )
+                    return best_lr, batch_size
+
+                fit = _local_window_quadratic_log_lr_fit(lrs_arr, losses_arr, half_window=2)
+                if fit is None:
+                    print(
+                        "  [LR Finder] convex quadratic fit unavailable; "
+                        "using peak-edge-of-stability rule.",
+                        flush=True,
+                    )
+                    best_lr = _pick_lr_peak_edge_of_stability(
+                        lr_losses, rel_slack=peak_rel_slack
+                    )
+                    return best_lr, batch_size
+
+                coeffs, lo, hi, lr_vertex = fit
+                lr_lo_w = float(lrs_arr[lo])
+                lr_hi_w = float(lrs_arr[hi - 1])
+                ref_steps = _effective_quadratic_interp_steps(quadratic_interp_steps)
+                vertex_only = _env_flag("LR_FINDER_USE_QUADRATIC_VERTEX_ONLY")
+
+                # Default: run mini-train again on ``ref_steps`` log-spaced LRs in the window; pick lowest loss.
+                if ref_steps >= 2 and not vertex_only:
+                    a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+                    print(
+                        f"  [LR Finder] quadratic fit on log(lr): loss ≈ {a:.4g}·t² + {b:.4g}·t + {c:.4g}  "
+                        f"(t = log lr), convex (a>0)",
+                        flush=True,
+                    )
+                    refine_lrs = _log_uniform_lrs(lr_lo_w, lr_hi_w, ref_steps)
+                    print(
+                        f"  [LR Finder] refinement mini-train ({ref_steps} log-spaced LRs between "
+                        f"{lr_lo_w:.2e} and {lr_hi_w:.2e}) …",
+                        flush=True,
+                    )
+                    refine_losses: dict[float, float] = {}
+                    for lr in refine_lrs:
+                        _restore_trainable_weights()
+                        try:
+                            avg_loss = _mini_train_mean_loss(
+                                model,
+                                dl,
+                                lr,
+                                device,
+                                optimizer_name,
+                                num_batches=mini_train_batches,
+                            )
+                            refine_losses[lr] = avg_loss
+                        except RuntimeError as exc:
+                            if "out of memory" in str(exc).lower():
+                                refine_losses[lr] = float("inf")
+                                _restore_trainable_weights()
+                                gc.collect()
+                                if device == "cuda" and torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+                            raise
+                        gc.collect()
+                        if device == "cuda" and torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+
+                    # Pick lowest mean loss by index order on ``refine_lrs`` (inclusive endpoints from
+                    # ``_log_uniform_lrs``). Ties: smallest index wins so first and last points are never
+                    # discriminated incorrectly vs middle points.
+                    idx_best: Optional[int] = None
+                    best_val = float("inf")
+                    for i, lr in enumerate(refine_lrs):
+                        v = refine_losses[lr]
+                        if math.isfinite(v) and v < best_val:
+                            best_val = v
+                            idx_best = i
+                    if idx_best is not None:
+                        best_lr = refine_lrs[idx_best]
+                        print(
+                            f"  [LR Finder] refinement mean loss ({ref_steps} points, "
+                            f"same mini_train_batches as coarse probe):",
+                            flush=True,
+                        )
+                        for i, lr in enumerate(refine_lrs):
+                            v = refine_losses[lr]
+                            loss_s = f"{v:.4f}" if math.isfinite(v) else "inf"
+                            mark = "  [best mini-train loss]" if i == idx_best else ""
+                            print(f"    lr={lr:.2e}  mean_loss={loss_s}{mark}", flush=True)
+                        print(
+                            f"  [LR Finder] selected LR from refinement mini-train: {best_lr:.2e}",
+                            flush=True,
+                        )
+                        return best_lr, batch_size
+
+                    print(
+                        "  [LR Finder] all refinement mini-trains failed; "
+                        "using peak-edge-of-stability rule.",
+                        flush=True,
+                    )
+                    best_lr = _pick_lr_peak_edge_of_stability(
+                        lr_losses, rel_slack=peak_rel_slack
+                    )
+                    return best_lr, batch_size
+
+                # Vertex-only / no refinement table: analytical vertex or peak fallback.
+                if lr_vertex is not None:
+                    lr_mark = lr_vertex
+                    if ref_steps >= 2:
+                        _print_quadratic_interp_table(
+                            coeffs,
+                            lr_lo_w,
+                            lr_hi_w,
+                            steps=ref_steps,
+                            lr_mark=lr_mark,
+                        )
+                    print(
+                        f"  [LR Finder] selected LR from convex quadratic vertex "
+                        f"(window [{lr_lo_w:.2e}, {lr_hi_w:.2e}]): {lr_vertex:.2e}",
+                        flush=True,
+                    )
+                    return lr_vertex, batch_size
+
+                print(
+                    "  [LR Finder] analytical vertex outside window; "
+                    "using peak-edge-of-stability rule.",
+                    flush=True,
+                )
                 best_lr = _pick_lr_peak_edge_of_stability(
                     lr_losses, rel_slack=peak_rel_slack
-                )
-                print(
-                    f"  [LR Finder] selected LR from mini-train grid: {best_lr:.2e}",
-                    flush=True,
                 )
                 return best_lr, batch_size
             except RuntimeError as exc:
@@ -664,6 +911,11 @@ def find_lr(
     )
     _peak_sl = float(dataset_type_dict.get("lr_finder_peak_rel_slack", peak_rel_slack))
     _peak_sl = max(0.0, min(3.0, _peak_sl))
+    try:
+        _qinterp = int(dataset_type_dict.get("lr_finder_quadratic_interp_steps", 10))
+    except (TypeError, ValueError):
+        _qinterp = 10
+    _qinterp = max(0, _qinterp)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     _proxy_grpo = bool(
@@ -687,7 +939,8 @@ def find_lr(
         + (f"  lora_r={lora_r}" if use_lora else "")
         + f"  optim={_opt_disp}  probe=tokenized(min_rows+fraction+tok_budget)  lr_probe_points={_points}"
         + f"  mini_train_batches={_mini_b}"
-        + f"  peak_rel_slack={_peak_sl:g}",
+        + f"  peak_rel_slack={_peak_sl:g}"
+        + f"  quadratic_interp_steps={_qinterp}",
         flush=True,
     )
     if _proxy_grpo:
@@ -844,6 +1097,7 @@ def find_lr(
             optimizer_name=optimizer_name,
             mini_train_batches=_mini_b,
             peak_rel_slack=_peak_sl,
+            quadratic_interp_steps=_qinterp,
             collate_fn=collate_fn,
         )
 

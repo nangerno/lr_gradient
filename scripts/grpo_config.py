@@ -236,6 +236,9 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "lr_finder_tight_after_job_kill": bool(
             train_info.get("lr_finder_tight_after_job_kill", False)
         ),
+        "lr_finder_quadratic_interp_steps": int(
+            train_info.get("lr_finder_quadratic_interp_steps", 10)
+        ),
         "lr_finder_peak_rel_slack": float(train_info.get("lr_finder_peak_rel_slack", 0.28)),
         "lr_finder_min_probe_rows": int(train_info.get("lr_finder_min_probe_rows", 32)),
         "lr_finder_probe_fraction": float(train_info.get("lr_finder_probe_fraction", 0.02)),
