@@ -9,7 +9,11 @@ from model_utility import (
 )
 from copy import deepcopy
 
-from lrs_lookup import apply_tokenized_lr_finder_to_run_config, effective_lr_finder_seq_len
+from lrs_lookup import (
+    apply_tokenized_lr_finder_to_run_config,
+    effective_lr_finder_probe_seq_len,
+    effective_lr_finder_seq_len,
+)
 
 
 def _bs_from_param_nums(param_nums) -> int:
@@ -123,6 +127,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "eval_batch_size",
         "output_dir",
         "request_path",
+        "warmup_ratio",
     ]
     for key in required_keys:
         if key not in config:
@@ -150,7 +155,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --logging_steps 5 \
     --learning_rate {learning_rate} \
     --weight_decay 0. \
-    --warmup_steps 35 \
+    --warmup_ratio {warmup_ratio} \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
     --tf32 True \
@@ -193,13 +198,15 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-    
+    _grad_ckpt = get_gradient_checkpointing(model_name)
+
     gpu_nums = max(1, get_gpu_count())
-    
+
     run_config = {
         "epoch_num": 2,
         "batch_size": _bs_from_param_nums(param_nums),
         "learning_rate": _lr_from_param_nums(param_nums),
+        "warmup_ratio": float(train_info.get("warmup_ratio", 0.03)),
         "min_lr_rate": 0.25,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
@@ -209,7 +216,7 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": "ddp",
-        "gradient_checkpointing": get_gradient_checkpointing(model_name),
+        "gradient_checkpointing": _grad_ckpt,
         "gradient_accumulation_steps": 4,
         "vllm_gpu_memory_utilization": _vllm_mem_from_param_nums(param_nums),
         "num_generations": 4,
@@ -217,7 +224,8 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "use_vllm": False if gpu_nums <= 1 else get_use_vllm(model_architecture, model_name),
         "tensor_parallel": False,
         "use_4bit": _use_4bit_from_param_nums(param_nums),
-        # Probe: mini-train on 2% of tokenized JSON; batch = safety (synthetic × headroom, OOM-safe).
+        "max_grad_norm": float(train_info.get("max_grad_norm", 1.0)),
+        # LR finder: GRPO-style clipped surrogate on ``grpo_train_*.json`` (teacher-forced completions).
         "lr_finder_lr_probe_points": int(
             train_info.get(
                 "lr_finder_lr_probe_points",
@@ -225,12 +233,27 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             )
         ),
         "lr_finder_mini_train_batches": int(
-            train_info.get("lr_finder_mini_train_batches", 1)
+            train_info.get("lr_finder_mini_train_batches", 20)
+        ),
+        "lr_finder_samples_per_lr": int(train_info.get("lr_finder_samples_per_lr", 80)),
+        "lr_finder_lr_pick_mode": str(
+            train_info.get("lr_finder_lr_pick_mode", "descending_segment")
+        ),
+        "lr_finder_pick_trim_low_lr_frac": float(
+            train_info.get("lr_finder_pick_trim_low_lr_frac", 0.2)
+        ),
+        "lr_finder_pick_explosion_rel_rolling_min": float(
+            train_info.get("lr_finder_pick_explosion_rel_rolling_min", 2.5)
+        ),
+        "lr_finder_pick_explosion_step_ratio": float(
+            train_info.get("lr_finder_pick_explosion_step_ratio", 1.5)
+        ),
+        "lr_finder_pick_segment_pick_frac": float(
+            train_info.get("lr_finder_pick_segment_pick_frac", 0.4)
         ),
         "lr_finder_seq_len": effective_lr_finder_seq_len(train_info),
-        "lr_finder_probe_seq_len": int(train_info.get("lr_finder_probe_seq_len", 512)),
-        "lr_finder_b_train_cap": int(train_info.get("lr_finder_b_train_cap", 2)),
-        "lr_finder_stratify_length": bool(train_info.get("lr_finder_stratify_length", True)),
+        "lr_finder_probe_seq_len": effective_lr_finder_probe_seq_len(train_info),
+        "lr_finder_b_train_cap": int(train_info.get("lr_finder_b_train_cap", 0)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
         "lr_finder_tight_after_job_kill": bool(
@@ -240,30 +263,24 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             train_info.get("lr_finder_quadratic_interp_steps", 10)
         ),
         "lr_finder_peak_rel_slack": float(train_info.get("lr_finder_peak_rel_slack", 0.28)),
-        "lr_finder_min_probe_rows": int(train_info.get("lr_finder_min_probe_rows", 32)),
-        "lr_finder_probe_fraction": float(train_info.get("lr_finder_probe_fraction", 0.02)),
-        "lr_finder_target_tokens_min": int(train_info.get("lr_finder_target_tokens_min", 50_000)),
-        "lr_finder_target_tokens_max": int(train_info.get("lr_finder_target_tokens_max", 200_000)),
+        "lr_finder_min_lr": float(train_info.get("lr_finder_min_lr", 1e-6)),
+        "lr_finder_max_lr": float(train_info.get("lr_finder_max_lr", 9e-3)),
+        "lr_finder_lora_r": int(train_info.get("lora_r", 128)),
+        "lr_finder_lora_alpha": int(train_info.get("lora_alpha", 256)),
+        "lr_finder_lora_dropout": float(train_info.get("lora_dropout", 0.05)),
+        "lr_finder_gradient_checkpointing": _grad_ckpt,
+        "lr_finder_task": "grpo",
+        "lr_finder_linear_scale_lr_to_effective_batch": bool(
+            train_info.get("lr_finder_linear_scale_lr_to_effective_batch", False)
+        ),
     }
 
     _slow_reward_funcs = if_contain_slow_reward_function(train_info["dataset_type"])
     if run_lr_finder and _slow_reward_funcs:
         print(
-            "[LR Finder] Slow GRPO rewards detected: LR/batch AutoML uses **SFT CE proxy** "
-            "on tokenized JSON only (no reward imports, no rollouts). "
-            "Full training still uses your configured reward functions.",
+            "[LR Finder] Slow GRPO rewards: mini-train still uses a **local clipped surrogate** "
+            "(no reward imports / no rollouts). Full training uses your reward functions.",
             flush=True,
-        )
-
-    if run_lr_finder:
-        apply_tokenized_lr_finder_to_run_config(
-            run_config,
-            train_info,
-            model_name,
-            model_path,
-            param_nums,
-            fallback_learning_rate=_lr_from_param_nums(param_nums),
-            grpo_slow_reward_proxy_probe=_slow_reward_funcs,
         )
 
     train_request = deepcopy(train_info)
@@ -305,6 +322,16 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
     run_config["eval_batch_size"] = 4
     if run_config["batch_size"] <= 4:
         run_config["eval_batch_size"] = 2
+
+    if run_lr_finder:
+        apply_tokenized_lr_finder_to_run_config(
+            run_config,
+            train_info,
+            model_name,
+            model_path,
+            param_nums,
+            fallback_learning_rate=_lr_from_param_nums(param_nums),
+        )
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
 

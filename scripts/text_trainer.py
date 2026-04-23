@@ -35,8 +35,9 @@ import pathlib
 from transformers import AutoConfig
 import lr_utils
 
-def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
-    # print(f"Running command: {cmd}", flush=True)
+def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None) -> int:
+    """Run ``cmd`` streaming to stdout and ``log_file_path``; return the process exit code."""
+    return_code = -1
     with open(log_file_path, "w") as log_file:
         # Prepare environment variables
         process_env = os.environ.copy()
@@ -66,6 +67,8 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
         # Log the return code
         log_file.write(f"\nProcess completed with return code: {return_code}\n")
 
+    return return_code
+
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
     # Use (\s+|$) so the pattern matches even when the arg is at end of string.
@@ -92,32 +95,41 @@ def _train_bundle_after_tokenize(
     ds_folder: str,
     bundle: dict,
     get_training_json_fn,
+    task_type: str,
 ) -> dict:
     """
-    Step 2–4 of the pipeline: with ``train_tokenized_{task_id}.json`` on disk, rebuild
-    config via ``get_training_json(..., run_lr_finder=True)`` so safe batch + LR come
-    from that file and land in ``run_cmd`` for real training.
-
-    Instruct/chat always produce the tokenized file; DPO/GRPO may not — if missing,
-    the bundle is unchanged (param-based LR/batch).
+    Run **after** the tokenize subprocess succeeds. Rebuild config via
+    ``get_training_json(..., run_lr_finder=True)`` when the task-specific dataset
+    for LR search exists (instruct/chat: ``train_tokenized_*.json``; DPO:
+    ``dpo_train_*.json``; GRPO: ``grpo_train_*.json``).
     """
-    tokenized_path = os.path.join(ds_folder, f"train_tokenized_{task_id}.json")
-    if not os.path.isfile(tokenized_path):
+    if task_type in (TaskType.INSTRUCTTEXTTASK.value, TaskType.CHATTASK.value):
+        probe_path = os.path.join(ds_folder, f"train_tokenized_{task_id}.json")
+    elif task_type == TaskType.DPOTASK.value:
+        probe_path = os.path.join(ds_folder, f"dpo_train_{task_id}.json")
+    elif task_type == TaskType.GRPOTASK.value:
+        probe_path = os.path.join(ds_folder, f"grpo_train_{task_id}.json")
+    else:
+        probe_path = os.path.join(ds_folder, f"train_tokenized_{task_id}.json")
+
+    if not os.path.isfile(probe_path):
         print(
             "[LR Finder] Skipping probe: "
-            f"{tokenized_path} not found after tokenization (keeping param-based LR/batch).",
+            f"{probe_path} not found after tokenization (keeping param-based LR/batch).",
             flush=True,
         )
         return bundle
     req = copy.deepcopy(bundle["train_request"])
-    req["tokenized_train_path"] = tokenized_path
+    tokenized_path = os.path.join(ds_folder, f"train_tokenized_{task_id}.json")
+    if os.path.isfile(tokenized_path):
+        req["tokenized_train_path"] = tokenized_path
     dt = req.get("dataset_type")
     if isinstance(dt, dict):
         dt = dict(dt)
         dt["tokenized_train_path"] = tokenized_path
         req["dataset_type"] = dt
     print(
-        f"[LR Finder] Tokenized data ready; running LR/batch probe on {tokenized_path}",
+        f"[LR Finder] Data ready; running LR/batch probe (gate file: {probe_path})",
         flush=True,
     )
     return get_training_json_fn(req, run_lr_finder=True)
@@ -486,12 +498,15 @@ def main():
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
 
-    # Training config pipeline (tokenized LR/batch probe when train_tokenized_*.json exists):
-    # 1) Tokenize dataset → datasets/train_tokenized_{task_id}.json (and dev_*).
-    # 2) Safe batch: synthetic max batch × headroom, then fit on real tokenized batches
-    #    (implemented inside lr_finder.find_lr).
-    # 3) LR: mini-train grid on ~2% of that JSON at batch ≤ safe batch (SFT CE).
-    # 4) Apply finder batch_size + learning_rate to the real train command (run_cmd).
+    # Training config pipeline (LR/batch probe after tokenize when the task dataset exists):
+    # 1) Tokenize → task-specific JSON under ``datasets/`` (incl. ``train_tokenized_*`` for SFT).
+    # 2) Safe batch: synthetic max batch × headroom, then optimizer fit (inside lr_finder.find_lr).
+    # 3) LR: mini-train grid at batch ≤ safe batch — loss matches ``lr_finder_task``
+    #    (SFT CE / DPO sigmoid / GRPO clipped surrogate).
+    # 4) Apply finder batch_size + learning_rate to ``run_cmd``.
+    #
+    # DPO/GRPO: ``train_dpo.py`` / ``train_grpo.py`` may still run an extra tokenization pass
+    # for TRL; LR search uses ``dpo_train_*`` / ``grpo_train_*`` directly.
     #
     # Phase 1: param-based LR/batch only — tokenized JSON does not exist yet.
     train_info = get_training_json_fn(train_info, run_lr_finder=False)
@@ -499,13 +514,27 @@ def main():
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
-    run_cmd_with_log(
+    print(
+        "[Pipeline] Step 1/2: Tokenizing dataset (must finish before LR finder). "
+        f"Command: {tokenize_cmd}",
+        flush=True,
+    )
+    _tok_rc = run_cmd_with_log(
         tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
     )
+    if _tok_rc != 0:
+        raise RuntimeError(
+            f"Tokenization failed with exit code {_tok_rc}; not running LR finder. "
+            f"See log: {os.path.join(ds_folder, f'tokenize_{args.task_id}.log')}"
+        )
 
-    # Phase 2: LR finder on the same tokenized file training will use (instruct/chat).
+    # Phase 2: LR finder only after tokenize — uses ``train_tokenized_{task_id}.json`` when present.
+    print(
+        "[Pipeline] Step 2/2: Rebuilding training config + LR finder on tokenized output …",
+        flush=True,
+    )
     train_info = _train_bundle_after_tokenize(
-        args.task_id, ds_folder, train_info, get_training_json_fn
+        args.task_id, ds_folder, train_info, get_training_json_fn, args.task_type
     )
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)

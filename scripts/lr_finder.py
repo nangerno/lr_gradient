@@ -3,7 +3,6 @@ import gc
 import json
 import math
 import os
-import random
 import tempfile
 from typing import Any, Callable, Optional
 
@@ -15,6 +14,22 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utility import pad_inputs
+
+from lr_finder_tasks import (
+    LR_TASK_DPO,
+    LR_TASK_GRPO,
+    LR_TASK_INSTRUCT,
+    _PreferenceCollator,
+    _pad_batch_dict as _grpo_pad_batch_dict,
+    build_dpo_preference_dataset,
+    build_grpo_teacher_forced_dataset,
+    dpo_sigmoid_loss,
+    grpo_style_clipped_loss,
+    mini_train_mean_loss_for_task,
+    normalize_lr_finder_task,
+    synthetic_dpo_batch,
+    synthetic_grpo_batch,
+)
 
 # Instruct: probe uses the same padded token tensors as ``MyDataset`` / ``train_instruct``.
 TOKENIZED_BATCH_KEY = "__lr_finder_tokenized__"
@@ -81,6 +96,55 @@ def _can_run(model, tokenizer, batch_size: int, seq_len: int, device: str) -> bo
         raise
 
 
+def _can_run_dpo(model, tokenizer, batch_pairs: int, seq_len: int, device: str, beta: float) -> bool:
+    """``batch_pairs`` preference pairs → ``2 * batch_pairs`` rows (TRL-shaped batch)."""
+    try:
+        inputs = synthetic_dpo_batch(tokenizer, batch_pairs, seq_len, device)
+        with _bf16_autocast(device):
+            loss = dpo_sigmoid_loss(model, inputs, beta=beta)
+        loss.backward()
+        model.zero_grad()
+        torch.cuda.empty_cache()
+        return True
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            torch.cuda.empty_cache()
+            return False
+        raise
+
+
+def _can_run_grpo(
+    model,
+    tokenizer,
+    batch_size: int,
+    seq_len: int,
+    device: str,
+    *,
+    epsilon_low: float,
+    epsilon_high: float,
+    beta: float,
+) -> bool:
+    try:
+        inputs = synthetic_grpo_batch(tokenizer, batch_size, seq_len, device)
+        with _bf16_autocast(device):
+            loss = grpo_style_clipped_loss(
+                model,
+                inputs,
+                epsilon_low=epsilon_low,
+                epsilon_high=epsilon_high,
+                beta=beta,
+            )
+        loss.backward()
+        model.zero_grad()
+        torch.cuda.empty_cache()
+        return True
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            torch.cuda.empty_cache()
+            return False
+        raise
+
+
 def find_max_batch_size(
     model,
     tokenizer,
@@ -89,13 +153,35 @@ def find_max_batch_size(
     *,
     headroom: float = 0.8,
     b_train_cap: Optional[int] = None,
+    lr_task: str = LR_TASK_INSTRUCT,
+    dpo_beta: float = 0.1,
+    grpo_epsilon_low: float = 0.2,
+    grpo_epsilon_high: float = 0.2,
+    grpo_beta: float = 0.04,
 ) -> tuple[int, int]:
-    if not _can_run(model, tokenizer, 1, seq_len, device):
-        # Avoid low=0 in binary search; real-data path in LR finder retries with smaller batch.
+    task = normalize_lr_finder_task(lr_task)
+
+    def _probe_ok(unit_batch: int) -> bool:
+        if task == LR_TASK_DPO:
+            return _can_run_dpo(model, tokenizer, unit_batch, seq_len, device, dpo_beta)
+        if task == LR_TASK_GRPO:
+            return _can_run_grpo(
+                model,
+                tokenizer,
+                unit_batch,
+                seq_len,
+                device,
+                epsilon_low=grpo_epsilon_low,
+                epsilon_high=grpo_epsilon_high,
+                beta=grpo_beta,
+            )
+        return _can_run(model, tokenizer, unit_batch, seq_len, device)
+
+    if not _probe_ok(1):
         return 1, 1
 
     batch = 1
-    while _can_run(model, tokenizer, batch, seq_len, device):
+    while _probe_ok(batch):
         batch *= 2
 
     low, high, best = batch // 2, batch, batch // 2
@@ -103,7 +189,7 @@ def find_max_batch_size(
         mid = (low + high) // 2
         if mid < 1:
             break
-        if _can_run(model, tokenizer, mid, seq_len, device):
+        if _probe_ok(mid):
             best = mid
             low = mid + 1
         else:
@@ -132,6 +218,133 @@ def get_lr_candidates(min_lr: float, max_lr: float, points: int) -> list[float]:
     log_max = math.log(max_lr)
     step = (log_max - log_min) / (points - 1)
     return [math.exp(log_min + i * step) for i in range(points)]
+
+
+def _effective_mini_train_batches(
+    mini_train_batches: int,
+    samples_per_lr: int,
+    per_device_batch_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """
+    Optimizer steps per LR probe: at least ``mini_train_batches``, and enough so that
+    ``optimizer_steps × batch_size × gas`` is at least ``samples_per_lr`` (when > 0).
+    """
+    base = max(1, int(mini_train_batches))
+    try:
+        sp = int(samples_per_lr)
+    except (TypeError, ValueError):
+        sp = 0
+    if sp <= 0:
+        return base
+    gas = max(1, int(gradient_accumulation_steps))
+    b = max(1, int(per_device_batch_size))
+    micro_per_opt_step = b * gas
+    need = (sp + micro_per_opt_step - 1) // micro_per_opt_step
+    return max(base, max(1, need))
+
+
+def _longest_strictly_decreasing_loss_run(losses: list[float]) -> tuple[int, int]:
+    """Inclusive index range of the longest contiguous run with losses[i] < losses[i-1]."""
+    n = len(losses)
+    if n == 0:
+        return 0, -1
+    if n == 1:
+        return 0, 0
+    best_lo, best_hi, best_len = 0, 0, 1
+    lo = 0
+    for i in range(1, n):
+        if not (losses[i] < losses[i - 1]):
+            hi = i - 1
+            ln = hi - lo + 1
+            if ln > best_len or (ln == best_len and hi > best_hi):
+                best_len, best_lo, best_hi = ln, lo, hi
+            lo = i
+    hi = n - 1
+    ln = hi - lo + 1
+    if ln > best_len or (ln == best_len and hi > best_hi):
+        best_lo, best_hi = lo, hi
+    return best_lo, best_hi
+
+
+def _lr_at_log_frac_inclusive(lrs: list[float], lo: int, hi: int, frac: float) -> float:
+    """``frac`` in [0,1] along log-spanned LR interval [lrs[lo], lrs[hi]]."""
+    if not lrs or lo > hi or lo < 0 or hi >= len(lrs):
+        return lrs[0] if lrs else 1e-6
+    frac = max(0.0, min(1.0, float(frac)))
+    if lo == hi:
+        return float(lrs[lo])
+    t0 = math.log(max(lrs[lo], 1e-300))
+    t1 = math.log(max(lrs[hi], 1e-300))
+    return float(math.exp(t0 + frac * (t1 - t0)))
+
+
+def _pick_lr_descending_segment(
+    lr_losses: dict[float, float],
+    *,
+    trim_low_lr_frac: float = 0.2,
+    explosion_rel_rolling_min: float = 2.5,
+    explosion_step_ratio: float = 1.5,
+    segment_pick_frac: float = 0.4,
+) -> tuple[float, str]:
+    """
+    Post-process coarse (lr → mean loss) curve:
+
+    1. Drop the lowest ``trim_low_lr_frac`` of LRs (too small / noisy left tail).
+    2. Truncate before the first **explosion**: loss ≫ rolling min or sharp jump vs previous.
+    3. Take the **longest** contiguous strictly loss-decreasing run (higher LR → lower loss).
+    4. Pick LR at ``segment_pick_frac`` along that segment in **log-LR** (0=start, 1=end).
+       Default 0.4 targets the 30–50% band center.
+    """
+    finite = [(lr, loss) for lr, loss in lr_losses.items() if math.isfinite(loss)]
+    if not finite:
+        lr0 = min(lr_losses.keys())
+        return lr0, "no finite mean losses; returning smallest LR key"
+    finite.sort(key=lambda x: x[0])
+    lrs = [float(x[0]) for x in finite]
+    losses = [float(x[1]) for x in finite]
+    n = len(lrs)
+    trim_k = int(math.floor(max(0.0, min(0.95, trim_low_lr_frac)) * n))
+    trim_k = min(trim_k, max(0, n - 3))
+    lrs, losses = lrs[trim_k:], losses[trim_k:]
+    n = len(lrs)
+    if n == 0:
+        return finite[len(finite) // 2][0], "trim removed all points; median LR"
+    if n == 1:
+        return lrs[0], "single point after low-LR trim"
+
+    end = n - 1
+    for i in range(1, n):
+        roll_min = min(losses[0 : i + 1])
+        floor = max(roll_min, 1e-12)
+        if losses[i] > explosion_rel_rolling_min * floor:
+            end = i - 1
+            break
+        prev = max(losses[i - 1], 1e-12)
+        if losses[i] > explosion_step_ratio * prev:
+            end = i - 1
+            break
+    if end < 0:
+        end = 0
+    lrs, losses = lrs[: end + 1], losses[: end + 1]
+    n = len(lrs)
+    if n == 0:
+        return finite[-1][0], "explosion clip emptied curve; last finite LR"
+
+    lo_s, hi_s = _longest_strictly_decreasing_loss_run(losses)
+    if lo_s > hi_s:
+        j = int(np.argmin(losses)) if losses else 0
+        j = max(0, min(j, len(lrs) - 1))
+        return lrs[j], "no decreasing run; argmin loss LR in clipped window"
+
+    pick_frac = max(0.0, min(1.0, float(segment_pick_frac)))
+    chosen = _lr_at_log_frac_inclusive(lrs, lo_s, hi_s, pick_frac)
+    msg = (
+        f"descending_segment: trim_low={trim_k} dropped LRs, "
+        f"explosion_end_index={end}, segment=[{lrs[lo_s]:.2e},{lrs[hi_s]:.2e}] "
+        f"log-frac={pick_frac:g} → lr={chosen:.2e}"
+    )
+    return chosen, msg
 
 
 def _pick_lr_peak_edge_of_stability(
@@ -167,6 +380,32 @@ def _pick_lr_peak_edge_of_stability(
 def _env_flag(name: str) -> bool:
     v = os.environ.get(name, "").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+def _pick_refinement_lr_with_tie_break(
+    refine_lrs: list[float],
+    refine_losses: dict[float, float],
+    *,
+    atol: float = 1e-5,
+    rtol: float = 1e-4,
+) -> tuple[Optional[int], float, float]:
+    """
+    Among refinement points, let ``min_v`` be the minimum finite mean loss. Keep every
+    point with loss ≤ ``min_v + atol + rtol·max(|min_v|, 1e-8)`` (near-optimal band), then
+    pick the **lowest LR** in that band (conservative; breaks DPO/GRPO ``0.0000`` ties).
+    """
+    triples: list[tuple[int, float, float]] = []
+    for i, lr in enumerate(refine_lrs):
+        v = refine_losses.get(lr, float("inf"))
+        if math.isfinite(v):
+            triples.append((i, lr, v))
+    if not triples:
+        return None, float("inf"), float("inf")
+    min_v = min(t[2] for t in triples)
+    margin = atol + rtol * max(abs(min_v), 1e-8)
+    pool = [(i, lr, v) for i, lr, v in triples if v <= min_v + margin]
+    i_best, lr_best, v_best = min(pool, key=lambda t: (t[1], t[0]))
+    return i_best, v_best, lr_best
 
 
 def _local_window_quadratic_log_lr_fit(
@@ -332,8 +571,16 @@ def _mini_train_mean_loss(
     optimizer_name: Optional[str],
     *,
     num_batches: int,
+    max_grad_norm: float = 1.0,
+    gradient_accumulation_steps: int = 1,
 ) -> float:
-    """Run ``num_batches`` optimizer steps at ``lr``; return mean **post-update** loss per batch."""
+    """
+    Run ``num_batches`` **optimizer** steps at ``lr``; return mean **post-update** loss.
+
+    When ``gradient_accumulation_steps`` > 1, each optimizer step matches HF Trainer:
+    ``loss / gas`` per micro-batch, accumulate backward, then ``clip_grad_norm`` + ``step()``.
+    """
+    gas = max(1, int(gradient_accumulation_steps))
     optimizer = _make_optimizer(model, lr, optimizer_name)
     try:
         trainable = _trainable_params(model)
@@ -341,23 +588,24 @@ def _mini_train_mean_loss(
         losses: list[float] = []
         batch_iter = _iter_batches_forever(dataloader)
         for _ in range(max(1, int(num_batches))):
-            batch = next(batch_iter)
-            inputs = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
-            with _bf16_autocast(device):
-                # Batch already includes ``labels``; do not pass ``labels=`` again (TypeError).
-                loss = model(**inputs).loss
-            if not torch.isfinite(loss):
-                return float("inf")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            last_inputs: Optional[dict[str, torch.Tensor]] = None
+            for _micro in range(gas):
+                batch = next(batch_iter)
+                inputs = {k: v.to(device) for k, v in batch.items()}
+                last_inputs = inputs
+                with _bf16_autocast(device):
+                    loss = model(**inputs).loss / float(gas)
+                if not torch.isfinite(loss):
+                    return float("inf")
+                loss.backward()
+            assert last_inputs is not None
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=max_grad_norm)
             optimizer.step()
-            # Must measure loss *after* the step; pre-step loss is identical for every LR when
-            # weights are restored each time (mini_train_batches=1 looked like a flat 1.76… grid).
             model.eval()
             with torch.no_grad():
                 with _bf16_autocast(device):
-                    loss_after = model(**inputs).loss
+                    loss_after = model(**last_inputs).loss
             model.train()
             if not torch.isfinite(loss_after):
                 return float("inf")
@@ -389,13 +637,30 @@ def _lr_finder_cap_batch_with_optimizer_probe(
     device: str,
     optimizer_name: Optional[str],
     synthetic_b_train: int,
+    probe_lrs: list[float],
+    max_grad_norm: float = 1.0,
+    lr_task: str = LR_TASK_INSTRUCT,
+    dpo_beta: float = 0.1,
+    grpo_epsilon_low: float = 0.2,
+    grpo_epsilon_high: float = 0.2,
+    grpo_beta: float = 0.04,
 ) -> int:
     """
     ``find_max_batch_size`` only checks forward + backward (no optimizer states).
-    LR search runs the same pattern as ``_mini_train_mean_loss`` (Adam + ``step()`` +
-    eval forward). Shrink batch until that fits so the grid starts at a safe size.
+
+    LR search uses the same step pattern as ``_mini_train_mean_loss`` (Adam + ``step()`` +
+    eval forward). For each **probe LR** (typically ``min_lr`` and ``max_lr`` from the
+    finder grid), shrink batch from the synthetic cap until that pattern fits (OOM or
+    non-finite loss). Return ``min(...)`` so the batch is safe across the LR range.
     """
+    task = normalize_lr_finder_task(lr_task)
     cap = max(1, int(synthetic_b_train))
+    unique_lrs = sorted(
+        {float(x) for x in probe_lrs if math.isfinite(x) and float(x) > 0.0}
+    )
+    if not unique_lrs:
+        unique_lrs = [1e-6]
+
     if device != "cuda" or not torch.cuda.is_available():
         return cap
 
@@ -448,28 +713,55 @@ def _lr_finder_cap_batch_with_optimizer_probe(
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-    b = cap
-    try:
+    def _max_batch_one_lr(probe_lr: float) -> int:
+        b = cap
         while b >= 1:
             optimizer: Any = None
             try:
                 _restore_trainable_weights()
-                inputs = _synthetic_lm_batch(tokenizer, b, seq_len, device)
-                optimizer = _make_optimizer(model, 1e-6, optimizer_name)
+                if task == LR_TASK_DPO:
+                    inputs = synthetic_dpo_batch(tokenizer, b, seq_len, device)
+                elif task == LR_TASK_GRPO:
+                    inputs = synthetic_grpo_batch(tokenizer, b, seq_len, device)
+                else:
+                    inputs = _synthetic_lm_batch(tokenizer, b, seq_len, device)
+                optimizer = _make_optimizer(model, probe_lr, optimizer_name)
                 trainable_params = _trainable_params(model)
                 model.train()
                 optimizer.zero_grad()
                 with _bf16_autocast(device):
-                    loss = model(**inputs).loss
+                    if task == LR_TASK_DPO:
+                        loss = dpo_sigmoid_loss(model, inputs, beta=dpo_beta)
+                    elif task == LR_TASK_GRPO:
+                        loss = grpo_style_clipped_loss(
+                            model,
+                            inputs,
+                            epsilon_low=grpo_epsilon_low,
+                            epsilon_high=grpo_epsilon_high,
+                            beta=grpo_beta,
+                        )
+                    else:
+                        loss = model(**inputs).loss
                 if not torch.isfinite(loss):
                     raise RuntimeError("non-finite loss in LR finder optimizer probe")
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
                 optimizer.step()
                 model.eval()
                 with torch.no_grad():
                     with _bf16_autocast(device):
-                        loss_after = model(**inputs).loss
+                        if task == LR_TASK_DPO:
+                            loss_after = dpo_sigmoid_loss(model, inputs, beta=dpo_beta)
+                        elif task == LR_TASK_GRPO:
+                            loss_after = grpo_style_clipped_loss(
+                                model,
+                                inputs,
+                                epsilon_low=grpo_epsilon_low,
+                                epsilon_high=grpo_epsilon_high,
+                                beta=grpo_beta,
+                            )
+                        else:
+                            loss_after = model(**inputs).loss
                 model.train()
                 if not torch.isfinite(loss_after):
                     raise RuntimeError("non-finite post-step loss in LR finder optimizer probe")
@@ -491,7 +783,7 @@ def _lr_finder_cap_batch_with_optimizer_probe(
             finally:
                 if optimizer is not None:
                     del optimizer
-                gc.collect()
+                    gc.collect()
                 if device == "cuda" and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -499,6 +791,23 @@ def _lr_finder_cap_batch_with_optimizer_probe(
             return b
 
         return 1
+
+    try:
+        per: list[tuple[float, int]] = []
+        for plr in unique_lrs:
+            b_m = _max_batch_one_lr(plr)
+            per.append((plr, b_m))
+            print(
+                f"[LR Finder] Optimizer probe at lr={plr:.2e}: max batch = {b_m}",
+                flush=True,
+            )
+        out = min(b for _, b in per)
+        if len(per) > 1:
+            print(
+                f"[LR Finder] Min batch over probe LRs → B_train = {out}",
+                flush=True,
+            )
+        return out
     finally:
         if cpu_snapshot is not None:
             del cpu_snapshot
@@ -538,6 +847,19 @@ def _run_mini_train_lr_grid(
     peak_rel_slack: float,
     quadratic_interp_steps: int = 10,
     collate_fn: Optional[Callable] = None,
+    max_grad_norm: float = 1.0,
+    shuffle_train_batches: bool = False,
+    dataloader_seed: int = 42,
+    mini_train_fn: Optional[Callable[..., float]] = None,
+    refinement_tie_atol: float = 1e-5,
+    refinement_tie_rtol: float = 1e-4,
+    gradient_accumulation_steps: int = 1,
+    samples_per_lr: int = 0,
+    lr_pick_mode: str = "quadratic",
+    pick_trim_low_lr_frac: float = 0.2,
+    pick_explosion_rel_rolling_min: float = 2.5,
+    pick_explosion_step_ratio: float = 1.5,
+    pick_segment_pick_frac: float = 0.4,
 ) -> tuple[float, int]:
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     total_trainable_bytes = sum(p.numel() * p.element_size() for _, p in trainable)
@@ -593,6 +915,43 @@ def _run_mini_train_lr_grid(
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
+    def _invoke_mini_train(
+        m,
+        dl: DataLoader,
+        lr: float,
+        dev: str,
+        on: Optional[str],
+        gn: float,
+    ) -> float:
+        _gas = max(1, int(gradient_accumulation_steps))
+        bs = int(getattr(dl, "batch_size", None) or 1)
+        nb = _effective_mini_train_batches(
+            mini_train_batches, samples_per_lr, bs, _gas
+        )
+        if mini_train_fn is not None:
+            return float(
+                mini_train_fn(
+                    m,
+                    dl,
+                    lr,
+                    dev,
+                    on,
+                    num_batches=nb,
+                    max_grad_norm=gn,
+                    gradient_accumulation_steps=_gas,
+                )
+            )
+        return _mini_train_mean_loss(
+            m,
+            dl,
+            lr,
+            dev,
+            on,
+            num_batches=nb,
+            max_grad_norm=gn,
+            gradient_accumulation_steps=_gas,
+        )
+
     start_batch = max(1, safe_batch)
     batch_size = start_batch
 
@@ -600,28 +959,62 @@ def _run_mini_train_lr_grid(
         while batch_size >= 1:
             try:
                 lr_losses: dict[float, float] = {}
-                dl = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    collate_fn=collate_fn,
-                    num_workers=0,
-                    pin_memory=False,
+                if shuffle_train_batches:
+                    _gen = torch.Generator()
+                    _gen.manual_seed(int(dataloader_seed))
+                    dl = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        generator=_gen,
+                        collate_fn=collate_fn,
+                        num_workers=0,
+                        pin_memory=False,
+                    )
+                else:
+                    dl = DataLoader(
+                        dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        collate_fn=collate_fn,
+                        num_workers=0,
+                        pin_memory=False,
+                    )
+                _gas_probe = max(1, int(gradient_accumulation_steps))
+                _nb_eff = _effective_mini_train_batches(
+                    mini_train_batches, samples_per_lr, batch_size, _gas_probe
+                )
+                _approx_seq = _nb_eff * batch_size * _gas_probe
+                print(
+                    f"  [LR Finder] probe batch_size={batch_size}  "
+                    f"optimizer_steps/LR={_nb_eff}  "
+                    f"(mini_train_batches≥{mini_train_batches}"
+                    + (
+                        f", samples_per_lr≥{samples_per_lr} → ≈{_approx_seq} seqs/LR)"
+                        if samples_per_lr > 0
+                        else ")"
+                    ),
+                    flush=True,
+                )
+                _mode_disp = str(lr_pick_mode or "quadratic").strip().lower()
+                print(
+                    f"  [LR Finder] lr_pick_mode={_mode_disp}",
+                    flush=True,
                 )
                 for lr in lr_candidates:
                     _restore_trainable_weights()
                     print(f"  [LR Finder] mini-train probe LR={lr:.2e} …", flush=True)
                     try:
-                        avg_loss = _mini_train_mean_loss(
+                        avg_loss = _invoke_mini_train(
                             model,
                             dl,
                             lr,
                             device,
                             optimizer_name,
-                            num_batches=mini_train_batches,
+                            max_grad_norm,
                         )
                         lr_losses[lr] = avg_loss
-                        print(f"    mean loss = {avg_loss:.4f}", flush=True)
+                        print(f"    mean loss = {avg_loss:.6g}", flush=True)
                     except RuntimeError as exc:
                         if "out of memory" in str(exc).lower():
                             lr_losses[lr] = float("inf")
@@ -654,6 +1047,23 @@ def _run_mini_train_lr_grid(
                 if _env_flag("LR_FINDER_USE_PEAK_RULE_ONLY"):
                     best_lr = _pick_lr_peak_edge_of_stability(
                         lr_losses, rel_slack=peak_rel_slack
+                    )
+                    return best_lr, batch_size
+
+                _pick_mode = str(lr_pick_mode or "quadratic").strip().lower()
+                if _pick_mode in ("descending_segment", "descending", "segment"):
+                    best_lr, pick_msg = _pick_lr_descending_segment(
+                        lr_losses,
+                        trim_low_lr_frac=pick_trim_low_lr_frac,
+                        explosion_rel_rolling_min=pick_explosion_rel_rolling_min,
+                        explosion_step_ratio=pick_explosion_step_ratio,
+                        segment_pick_frac=pick_segment_pick_frac,
+                    )
+                    print(f"  [LR Finder] {pick_msg}", flush=True)
+                    print(
+                        f"  [LR Finder] selected LR (longest decreasing loss vs LR, "
+                        f"log-frac={pick_segment_pick_frac:g} in segment): {best_lr:.2e}",
+                        flush=True,
                     )
                     return best_lr, batch_size
 
@@ -693,13 +1103,13 @@ def _run_mini_train_lr_grid(
                     for lr in refine_lrs:
                         _restore_trainable_weights()
                         try:
-                            avg_loss = _mini_train_mean_loss(
+                            avg_loss = _invoke_mini_train(
                                 model,
                                 dl,
                                 lr,
                                 device,
                                 optimizer_name,
-                                num_batches=mini_train_batches,
+                                max_grad_norm,
                             )
                             refine_losses[lr] = avg_loss
                         except RuntimeError as exc:
@@ -716,26 +1126,23 @@ def _run_mini_train_lr_grid(
                             torch.cuda.synchronize()
                             torch.cuda.empty_cache()
 
-                    # Pick lowest mean loss by index order on ``refine_lrs`` (inclusive endpoints from
-                    # ``_log_uniform_lrs``). Ties: smallest index wins so first and last points are never
-                    # discriminated incorrectly vs middle points.
-                    idx_best: Optional[int] = None
-                    best_val = float("inf")
-                    for i, lr in enumerate(refine_lrs):
-                        v = refine_losses[lr]
-                        if math.isfinite(v) and v < best_val:
-                            best_val = v
-                            idx_best = i
+                    # Pick lowest mean loss; ties within atol/rtol → **lower LR** (conservative).
+                    idx_best, best_val, _best_lr_chosen = _pick_refinement_lr_with_tie_break(
+                        refine_lrs,
+                        refine_losses,
+                        atol=refinement_tie_atol,
+                        rtol=refinement_tie_rtol,
+                    )
                     if idx_best is not None:
                         best_lr = refine_lrs[idx_best]
                         print(
                             f"  [LR Finder] refinement mean loss ({ref_steps} points, "
-                            f"same mini_train_batches as coarse probe):",
+                            f"same optimizer_steps/LR as coarse probe; ties → lower LR):",
                             flush=True,
                         )
                         for i, lr in enumerate(refine_lrs):
                             v = refine_losses[lr]
-                            loss_s = f"{v:.4f}" if math.isfinite(v) else "inf"
+                            loss_s = f"{v:.6g}" if math.isfinite(v) else "inf"
                             mark = "  [best mini-train loss]" if i == idx_best else ""
                             print(f"    lr={lr:.2e}  mean_loss={loss_s}{mark}", flush=True)
                         print(
@@ -805,7 +1212,7 @@ def _run_mini_train_lr_grid(
 
 
 # --------------------------------------------------------------------------- #
-# Dataset loading — 2% of tokenized instruct JSON
+# Dataset loading — full ``train_tokenized_*.json`` (same file as real training)
 # --------------------------------------------------------------------------- #
 
 def _lr_finder_tight_headroom_after_kill(dataset_type_dict: dict) -> bool:
@@ -834,49 +1241,6 @@ def _config_bool_or_default(value, default: bool) -> bool:
         if s in ("1", "true", "yes", "y", "on"):
             return True
     return bool(value)
-
-
-def _stratified_sample_by_token_length(
-    rows: list[dict],
-    k: int,
-    seed: int,
-) -> list[dict]:
-    """Stratify probe rows by ``len(input_ids)`` (matches training sequence lengths)."""
-    rng = random.Random(seed)
-    valid_idx = [
-        i
-        for i, r in enumerate(rows)
-        if isinstance(r.get("input_ids"), list) and len(r["input_ids"]) > 0
-    ]
-    if not valid_idx:
-        valid_idx = list(range(len(rows)))
-    if len(valid_idx) <= k:
-        return [rows[i] for i in valid_idx]
-
-    valid_idx.sort(key=lambda i: len(rows[i]["input_ids"]))
-    if k < 4 or len(valid_idx) < 4:
-        rng.shuffle(valid_idx)
-        return [rows[i] for i in valid_idx[:k]]
-
-    n_bins = 4
-    per, rem = divmod(k, n_bins)
-    picked: list[int] = []
-    for b in range(n_bins):
-        lo = b * len(valid_idx) // n_bins
-        hi = (b + 1) * len(valid_idx) // n_bins
-        bucket = valid_idx[lo:hi]
-        take = per + (1 if b < rem else 0)
-        if not bucket or take <= 0:
-            continue
-        rng.shuffle(bucket)
-        picked.extend(bucket[:take])
-
-    if len(picked) < k:
-        pool = [i for i in valid_idx if i not in set(picked)]
-        rng.shuffle(pool)
-        picked.extend(pool[: k - len(picked)])
-    rng.shuffle(picked)
-    return [rows[i] for i in picked[:k]]
 
 
 def _normalize_tokenized_row(ex: dict) -> Optional[dict]:
@@ -926,91 +1290,25 @@ def _make_tokenized_collate_fn(
     return _collate
 
 
-def _row_token_count(row: dict) -> int:
-    ids = row.get("input_ids")
-    return len(ids) if isinstance(ids, list) else 0
-
-
-def _expand_indices_to_token_targets(
-    data: list[dict],
-    picked: set[int],
-    rng: random.Random,
-    target_tokens_min: int,
-    target_tokens_max: int,
-) -> set[int]:
-    """Add rows until total tokens ≥ ``target_tokens_min`` (cap at ``target_tokens_max`` sum)."""
-    total = sum(_row_token_count(data[i]) for i in picked)
-    if total >= target_tokens_min:
-        return picked
-    pool = [i for i in range(len(data)) if i not in picked]
-    rng.shuffle(pool)
-    for idx in pool:
-        if total >= target_tokens_min:
-            break
-        picked.add(idx)
-        total += _row_token_count(data[idx])
-        if total >= target_tokens_max:
-            break
-    return picked
-
-
-def _load_tokenized_probe_dataset(
-    tokenized_path: str,
-    *,
-    stratify_by_length: bool,
-    seed: int,
-    min_probe_rows: int = 32,
-    probe_fraction: float = 0.02,
-    target_tokens_min: int = 50_000,
-    target_tokens_max: int = 200_000,
-) -> tuple[Dataset, str]:
+def _load_full_tokenized_train_dataset(tokenized_path: str) -> tuple[Dataset, str, int]:
     """
-    Probe subset for LR search: at least ``max(min_probe_rows, ceil(probe_fraction * N))``
-    rows (capped by ``N``), then expand with random rows until total token count reaches
-    ``target_tokens_min`` when data allows (up to ``target_tokens_max`` total tokens).
-
-    Same JSON format as ``MyDataset`` / ``train_tokenized_*.json``.
+    Load **every** example from ``train_tokenized_*.json`` — the same on-disk artifact
+    produced before real training (no separate probe subset).
     """
     with open(tokenized_path, "r", encoding="utf-8") as f:
         raw_list = json.load(f)
     if not isinstance(raw_list, list):
         raise ValueError(f"Tokenized dataset must be a JSON list: {tokenized_path}")
-    data = []
+    data: list[dict] = []
     for ex in raw_list:
         if isinstance(ex, dict):
             norm = _normalize_tokenized_row(ex)
             if norm is not None:
                 data.append(norm)
-    n_rows = len(data)
-    if n_rows == 0:
+    if not data:
         return Dataset.from_list([]), TOKENIZED_BATCH_KEY, 0
-
-    pf = max(0.0, min(1.0, float(probe_fraction)))
-    base_k = max(min_probe_rows, int(math.ceil(n_rows * pf)))
-    base_k = max(1, min(base_k, n_rows))
-
-    rng = random.Random(seed)
-    if stratify_by_length:
-        initial_rows = _stratified_sample_by_token_length(data, base_k, seed)
-        picked = {
-            i
-            for i, r in enumerate(data)
-            if any(r is x for x in initial_rows)
-        }
-        if not picked:
-            picked = set(range(min(base_k, n_rows)))
-    else:
-        order = list(range(n_rows))
-        rng.shuffle(order)
-        picked = set(order[:base_k])
-
-    picked = _expand_indices_to_token_targets(
-        data, picked, rng, target_tokens_min, target_tokens_max
-    )
-    subset = [data[i] for i in sorted(picked)]
-    total_tokens = sum(_row_token_count(r) for r in subset)
-
-    return Dataset.from_list(subset), TOKENIZED_BATCH_KEY, total_tokens
+    total_tokens = sum(len(r["input_ids"]) for r in data)
+    return Dataset.from_list(data), TOKENIZED_BATCH_KEY, total_tokens
 
 
 # --------------------------------------------------------------------------- #
@@ -1027,32 +1325,60 @@ def find_lr(
     min_lr: float = 1e-6,
     max_lr: float = 9e-3,
     lr_probe_points: int = 28,
-    mini_train_batches: int = 1,
+    mini_train_batches: int = 20,
     seq_len: int = 1024,
     lora_threshold: Optional[int] = None,
     lora_r: int = _DEFAULT_LORA_R,
     lora_alpha: int = _DEFAULT_LORA_ALPHA,
     lora_dropout: float = _DEFAULT_LORA_DROPOUT,
     optimizer_name: Optional[str] = None,
-    lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
-    grpo_slow_reward_proxy_probe: bool = False,
     peak_rel_slack: float = 0.28,
     max_lr_probe_batch: Optional[int] = None,
 ) -> Optional[dict]:
     if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         print(
-            "[LR Finder] tokenized_dataset_path missing or not a file; need train_tokenized JSON.",
+            "[LR Finder] dataset_path missing or not a file (see lr_finder_task / tokenize output).",
             flush=True,
         )
         return None
 
-    use_lora = (
-        lora_threshold is not None
-        and num_params is not None
-        and num_params >= lora_threshold
+    min_lr = float(min_lr)
+    max_lr = float(max_lr)
+    if min_lr > max_lr:
+        min_lr, max_lr = max_lr, min_lr
+
+    if "lr_finder_use_lora" in dataset_type_dict:
+        use_lora = bool(dataset_type_dict["lr_finder_use_lora"])
+    else:
+        use_lora = (
+            lora_threshold is not None
+            and num_params is not None
+            and num_params >= lora_threshold
+        )
+    try:
+        _lora_r = int(dataset_type_dict.get("lr_finder_lora_r", lora_r))
+    except (TypeError, ValueError):
+        _lora_r = int(lora_r)
+    try:
+        _lora_alpha = int(dataset_type_dict.get("lr_finder_lora_alpha", lora_alpha))
+    except (TypeError, ValueError):
+        _lora_alpha = int(lora_alpha)
+    try:
+        _lora_do = float(dataset_type_dict.get("lr_finder_lora_dropout", lora_dropout))
+    except (TypeError, ValueError):
+        _lora_do = float(lora_dropout)
+    try:
+        _max_gn = float(dataset_type_dict.get("lr_finder_max_grad_norm", 1.0))
+    except (TypeError, ValueError):
+        _max_gn = 1.0
+    if not math.isfinite(_max_gn) or _max_gn <= 0:
+        _max_gn = 1.0
+    _gc_train = _config_bool_or_default(
+        dataset_type_dict.get("lr_finder_gradient_checkpointing"), True
     )
+
     _points = max(
         2,
         int(dataset_type_dict.get("lr_finder_lr_probe_points", lr_probe_points)),
@@ -1061,6 +1387,46 @@ def find_lr(
         1,
         int(dataset_type_dict.get("lr_finder_mini_train_batches", mini_train_batches)),
     )
+    try:
+        _gas_lr = int(dataset_type_dict.get("lr_finder_gradient_accumulation_steps", 1))
+    except (TypeError, ValueError):
+        _gas_lr = 1
+    _gas_lr = max(1, _gas_lr)
+    try:
+        _samples_plr = int(dataset_type_dict.get("lr_finder_samples_per_lr", 80))
+    except (TypeError, ValueError):
+        _samples_plr = 80
+    _samples_plr = max(0, _samples_plr)
+    _lr_pick_mode = str(
+        dataset_type_dict.get("lr_finder_lr_pick_mode", "descending_segment")
+        or "descending_segment"
+    ).strip().lower()
+    try:
+        _pick_trim = float(dataset_type_dict.get("lr_finder_pick_trim_low_lr_frac", 0.2))
+    except (TypeError, ValueError):
+        _pick_trim = 0.2
+    _pick_trim = max(0.0, min(0.95, _pick_trim))
+    try:
+        _pick_expl_rel = float(
+            dataset_type_dict.get("lr_finder_pick_explosion_rel_rolling_min", 2.5)
+        )
+    except (TypeError, ValueError):
+        _pick_expl_rel = 2.5
+    _pick_expl_rel = max(1.01, _pick_expl_rel)
+    try:
+        _pick_expl_step = float(
+            dataset_type_dict.get("lr_finder_pick_explosion_step_ratio", 1.5)
+        )
+    except (TypeError, ValueError):
+        _pick_expl_step = 1.5
+    _pick_expl_step = max(1.01, _pick_expl_step)
+    try:
+        _pick_seg_frac = float(
+            dataset_type_dict.get("lr_finder_pick_segment_pick_frac", 0.4)
+        )
+    except (TypeError, ValueError):
+        _pick_seg_frac = 0.4
+    _pick_seg_frac = max(0.0, min(1.0, _pick_seg_frac))
     _peak_sl = float(dataset_type_dict.get("lr_finder_peak_rel_slack", peak_rel_slack))
     _peak_sl = max(0.0, min(3.0, _peak_sl))
     try:
@@ -1070,38 +1436,72 @@ def find_lr(
     _qinterp = max(0, _qinterp)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    _proxy_grpo = bool(
-        dataset_type_dict.get("lr_finder_grpo_slow_reward_proxy", grpo_slow_reward_proxy_probe)
-    )
+    _lr_task = normalize_lr_finder_task(dataset_type_dict.get("lr_finder_task", LR_TASK_INSTRUCT))
+    try:
+        _dpo_beta = float(
+            dataset_type_dict.get("lr_finder_dpo_beta", dataset_type_dict.get("beta", 0.1))
+        )
+    except (TypeError, ValueError):
+        _dpo_beta = 0.1
+    try:
+        _grpo_beta = float(dataset_type_dict.get("lr_finder_grpo_beta", 0.04))
+    except (TypeError, ValueError):
+        _grpo_beta = 0.04
+    try:
+        _geps_lo = float(dataset_type_dict.get("lr_finder_grpo_epsilon_low", 0.2))
+    except (TypeError, ValueError):
+        _geps_lo = 0.2
+    try:
+        _geps_hi = float(dataset_type_dict.get("lr_finder_grpo_epsilon_high", 0.2))
+    except (TypeError, ValueError):
+        _geps_hi = 0.2
+    _grpo_beta_probe = 0.0 if (_lr_task == LR_TASK_GRPO and not use_lora) else _grpo_beta
+
     _opt_disp = optimizer_name or "adamw_torch"
-    _probe_tag = (
-        "GRPO_slow_reward→SFT_CE_proxy"
-        if _proxy_grpo
-        else "tokenized_SFT_CE"
-    )
+    if _lr_task == LR_TASK_DPO:
+        _probe_tag = "DPO_sigmoid"
+    elif _lr_task == LR_TASK_GRPO:
+        _probe_tag = "GRPO_clipped_surrogate"
+    else:
+        _probe_tag = "SFT_CE"
     _probe_seq_cfg = dataset_type_dict.get("lr_finder_probe_seq_len")
     try:
-        _probe_cap = int(_probe_seq_cfg) if _probe_seq_cfg is not None else 512
+        _probe_cap = (
+            int(_probe_seq_cfg)
+            if _probe_seq_cfg is not None
+            else max(1, int(seq_len))
+        )
     except (TypeError, ValueError):
-        _probe_cap = 512
+        _probe_cap = max(1, int(seq_len))
     _probe_cap = max(1, _probe_cap)
 
     print(
         f"[LR Finder] model={model_id}  mini_train={_probe_tag}  params={num_params}  lora={use_lora}"
-        + (f"  lora_r={lora_r}" if use_lora else "")
-        + f"  optim={_opt_disp}  probe=tokenized(min_rows+fraction+tok_budget)  lr_probe_points={_points}"
+        + (f"  lora_r={_lora_r}" if use_lora else "")
+        + f"  optim={_opt_disp}  task={_lr_task}  lr_probe_points={_points}"
         + f"  mini_train_batches={_mini_b}"
+        + f"  samples_per_lr={_samples_plr}"
+        + f"  lr_pick_mode={_lr_pick_mode}"
+        + f"  grad_accum_steps={_gas_lr} (match training GAS in run_config)"
         + f"  peak_rel_slack={_peak_sl:g}"
-        + f"  quadratic_interp_steps={_qinterp}",
+        + f"  quadratic_interp_steps={_qinterp}"
+        + f"  max_grad_norm={_max_gn:g}",
         flush=True,
     )
-    if _proxy_grpo:
+    if _lr_task == LR_TASK_GRPO and not use_lora:
         print(
-            "[LR Finder] GRPO slow-reward task: this probe uses **SFT cross-entropy only** "
-            "on tokenized JSON (no rollouts, no reward funcs — langcheck/detoxify/textstat/etc.). "
-            "Found LR/batch apply to full GRPO training afterward.",
+            "[LR Finder] GRPO probe without LoRA: reference KL uses the same weights as policy "
+            "(degenerate); KL coefficient forced to 0.0 for this search.",
             flush=True,
         )
+
+    if _lr_task == LR_TASK_DPO and not use_lora:
+        print(
+            "[LR Finder] DPO mini-train requires LoRA so the frozen base model can serve as "
+            "the implicit reference. Skipping LR finder.",
+            flush=True,
+        )
+        return None
 
     try:
         # ------------------------------------------------------------------ #
@@ -1128,10 +1528,10 @@ def find_lr(
         if use_lora:
             target_modules = _find_all_linear_names(model)
             lora_cfg = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
+                r=_lora_r,
+                lora_alpha=_lora_alpha,
                 target_modules=target_modules,
-                lora_dropout=lora_dropout,
+                lora_dropout=_lora_do,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM,
             )
@@ -1143,7 +1543,13 @@ def find_lr(
 
         # use_cache is incompatible with gradient checkpointing — disable it first.
         model.config.use_cache = False
-        model.gradient_checkpointing_enable()
+        if _gc_train:
+            model.gradient_checkpointing_enable()
+        else:
+            try:
+                model.gradient_checkpointing_disable()
+            except AttributeError:
+                pass
 
         # ------------------------------------------------------------------ #
         # Probe seq cap: synthetic search + collate pad to min(train seq, lr_finder_probe_seq_len).
@@ -1171,15 +1577,18 @@ def find_lr(
         else:
             _hr = _base_hr
         _hr = _hr if 0 < _hr <= 1.0 else 0.8
-        _bcap_raw = dataset_type_dict.get("lr_finder_b_train_cap", 4)
+        _bcap_raw = dataset_type_dict.get("lr_finder_b_train_cap", 0)
         try:
-            _b_train_cap = int(_bcap_raw) if _bcap_raw is not None else 4
+            _b_train_cap = int(_bcap_raw) if _bcap_raw is not None else 0
         except (TypeError, ValueError):
-            _b_train_cap = 4
+            _b_train_cap = 0
         if _b_train_cap <= 0:
             _b_train_cap = None
+        _grid_lr_lo = min(float(min_lr), float(max_lr))
+        _grid_lr_hi = max(float(min_lr), float(max_lr))
         print(
-            "[LR Finder] Probing max batch size (synthetic seq_len=probe) …",
+            "[LR Finder] Probing max batch size (synthetic seq_len=probe), "
+            f"then optimizer fit at grid lr ∈ {{{_grid_lr_lo:.2e}, {_grid_lr_hi:.2e}}} …",
             flush=True,
         )
         b_max, b_train_syn = find_max_batch_size(
@@ -1189,6 +1598,16 @@ def find_lr(
             device=device,
             headroom=_hr,
             b_train_cap=_b_train_cap,
+            lr_task=_lr_task,
+            dpo_beta=_dpo_beta,
+            grpo_epsilon_low=_geps_lo,
+            grpo_epsilon_high=_geps_hi,
+            grpo_beta=_grpo_beta_probe,
+        )
+        _probe_lrs = (
+            [_grid_lr_lo]
+            if _grid_lr_lo == _grid_lr_hi
+            else [_grid_lr_lo, _grid_lr_hi]
         )
         b_train = _lr_finder_cap_batch_with_optimizer_probe(
             model,
@@ -1197,6 +1616,13 @@ def find_lr(
             device=device,
             optimizer_name=optimizer_name,
             synthetic_b_train=b_train_syn,
+            probe_lrs=_probe_lrs,
+            max_grad_norm=_max_gn,
+            lr_task=_lr_task,
+            dpo_beta=_dpo_beta,
+            grpo_epsilon_low=_geps_lo,
+            grpo_epsilon_high=_geps_hi,
+            grpo_beta=_grpo_beta_probe,
         )
         _bmsg = f"headroom={_hr:g}"
         if _b_train_cap:
@@ -1227,40 +1653,97 @@ def find_lr(
                     )
                 safe_batch = min(safe_batch, _cap_bs)
 
-        _strat = _config_bool_or_default(
-            dataset_type_dict.get("lr_finder_stratify_length"),
-            lr_sample_stratify,
-        )
         _sseed = int(dataset_type_dict.get("lr_finder_sample_seed", lr_sample_seed))
 
-        _min_rows = int(dataset_type_dict.get("lr_finder_min_probe_rows", 32))
-        _probe_frac = float(dataset_type_dict.get("lr_finder_probe_fraction", 0.02))
-        _tok_min = int(dataset_type_dict.get("lr_finder_target_tokens_min", 50_000))
-        _tok_max = int(dataset_type_dict.get("lr_finder_target_tokens_max", 200_000))
+        print(
+            f"[LR Finder] Loading training data for mini-train: {tokenized_dataset_path} …",
+            flush=True,
+        )
+        if _lr_task == LR_TASK_INSTRUCT:
+            sample_ds, _, probe_tokens = _load_full_tokenized_train_dataset(tokenized_dataset_path)
+            collate_fn = _make_tokenized_collate_fn(tokenizer, effective_probe_seq)
+            _ds_note = "train_tokenized JSON (SFT CE)"
+        elif _lr_task == LR_TASK_DPO:
+            sample_ds = build_dpo_preference_dataset(
+                tokenized_dataset_path, dataset_type_dict, tokenizer
+            )
+            _pad_id = int(tokenizer.pad_token_id or 0)
+            collate_fn = _PreferenceCollator(
+                pad_token_id=_pad_id,
+                max_length=effective_probe_seq,
+                truncation_mode="keep_start",
+            )
+            probe_tokens = 0
+            for _i in range(len(sample_ds)):
+                ex = sample_ds[_i]
+                probe_tokens += len(ex["prompt_ids"]) + len(ex["chosen_ids"]) + len(
+                    ex["rejected_ids"]
+                )
+            _ds_note = "dpo_train JSON (TRL-style DPO loss)"
+        else:
+            try:
+                _mcl_cfg = int(
+                    dataset_type_dict.get(
+                        "lr_finder_grpo_max_completion_length",
+                        dataset_type_dict.get("max_completion_length", 256),
+                    )
+                )
+            except (TypeError, ValueError):
+                _mcl_cfg = 256
+            _mcl = max(1, min(_mcl_cfg, 128))
+            _mpl = max(1, int(effective_probe_seq) - _mcl)
+            sample_ds = build_grpo_teacher_forced_dataset(
+                tokenized_dataset_path,
+                dataset_type_dict,
+                tokenizer,
+                max_prompt_tokens=_mpl,
+                completion_len=_mcl,
+            )
+            _pad_id = int(tokenizer.pad_token_id or 0)
+            collate_fn = lambda batch: _grpo_pad_batch_dict(batch, _pad_id)
+            probe_tokens = (_mpl + _mcl) * len(sample_ds)
+            _ds_note = "grpo_train JSON (clipped surrogate + KL, teacher-forced completions)"
 
         print(
-            f"[LR Finder] Loading probe subset from tokenized data: {tokenized_dataset_path} …",
+            f"[LR Finder] Dataset rows: {len(sample_ds)}  ~{probe_tokens} tokens  "
+            f"({_ds_note}; probe_seq_cap={effective_probe_seq})",
             flush=True,
         )
-        sample_ds, _, probe_tokens = _load_tokenized_probe_dataset(
-            tokenized_dataset_path,
-            stratify_by_length=_strat,
-            seed=_sseed,
-            min_probe_rows=max(1, _min_rows),
-            probe_fraction=_probe_frac,
-            target_tokens_min=max(0, _tok_min),
-            target_tokens_max=max(_tok_min, _tok_max),
-        )
-        collate_fn = _make_tokenized_collate_fn(tokenizer, effective_probe_seq)
-        print(
-            f"[LR Finder] Probe rows: {len(sample_ds)}  ~{probe_tokens} tokens  "
-            f"(floor=max({_min_rows},{_probe_frac:g}·N), target {_tok_min}–{_tok_max} tok; "
-            f"stratify={_strat}; pad/collate_seq_len={effective_probe_seq})",
-            flush=True,
-        )
+
+        _mini_train_fn: Optional[Callable[..., float]] = None
+        if _lr_task != LR_TASK_INSTRUCT:
+            def _mini_train_fn(
+                m,
+                dl: DataLoader,
+                lr: float,
+                dev: str,
+                on: Optional[str],
+                *,
+                num_batches: int,
+                max_grad_norm: float,
+                gradient_accumulation_steps: int = 1,
+            ) -> float:
+                return mini_train_mean_loss_for_task(
+                    _lr_task,
+                    m,
+                    dl,
+                    lr,
+                    dev,
+                    on,
+                    num_batches=num_batches,
+                    max_grad_norm=max_grad_norm,
+                    dpo_beta=_dpo_beta,
+                    grpo_epsilon_low=_geps_lo,
+                    grpo_epsilon_high=_geps_hi,
+                    grpo_beta=_grpo_beta_probe,
+                    _make_optimizer=_make_optimizer,
+                    _trainable_params=_trainable_params,
+                    _bf16_autocast=_bf16_autocast,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                )
 
         if len(sample_ds) == 0:
-            print("[LR Finder] Empty probe sample; cannot run LR search.", flush=True)
+            print("[LR Finder] Empty tokenized train set; cannot run LR search.", flush=True)
             return None
 
         lr_candidates = get_lr_candidates(min_lr, max_lr, _points)
@@ -1268,6 +1751,17 @@ def find_lr(
             f"[LR Finder] Mini-train LR grid: {_points} candidates  {min_lr:.2e} → {max_lr:.2e}",
             flush=True,
         )
+        try:
+            _tie_atol = float(dataset_type_dict.get("lr_finder_refinement_tie_atol", 1e-5))
+        except (TypeError, ValueError):
+            _tie_atol = 1e-5
+        try:
+            _tie_rtol = float(dataset_type_dict.get("lr_finder_refinement_tie_rtol", 1e-4))
+        except (TypeError, ValueError):
+            _tie_rtol = 1e-4
+        _tie_atol = max(0.0, _tie_atol)
+        _tie_rtol = max(0.0, _tie_rtol)
+
         best_lr, probe_batch = _run_mini_train_lr_grid(
             model,
             sample_ds,
@@ -1279,7 +1773,56 @@ def find_lr(
             peak_rel_slack=_peak_sl,
             quadratic_interp_steps=_qinterp,
             collate_fn=collate_fn,
+            max_grad_norm=_max_gn,
+            shuffle_train_batches=True,
+            dataloader_seed=_sseed,
+            mini_train_fn=_mini_train_fn,
+            refinement_tie_atol=_tie_atol,
+            refinement_tie_rtol=_tie_rtol,
+            gradient_accumulation_steps=_gas_lr,
+            samples_per_lr=_samples_plr,
+            lr_pick_mode=_lr_pick_mode,
+            pick_trim_low_lr_frac=_pick_trim,
+            pick_explosion_rel_rolling_min=_pick_expl_rel,
+            pick_explosion_step_ratio=_pick_expl_step,
+            pick_segment_pick_frac=_pick_seg_frac,
         )
+
+        best_lr_raw = float(best_lr)
+        best_lr_out = best_lr_raw
+        _linear_scale = bool(
+            dataset_type_dict.get("lr_finder_linear_scale_lr_to_effective_batch", False)
+        )
+        _scale_msg = ""
+        if _linear_scale:
+            try:
+                _plan_bs = int(
+                    dataset_type_dict.get(
+                        "lr_finder_planned_per_device_batch_size", probe_batch
+                    )
+                )
+            except (TypeError, ValueError):
+                _plan_bs = int(probe_batch)
+            try:
+                _plan_gpus = max(
+                    1, int(dataset_type_dict.get("lr_finder_planned_gpu_nums", 1))
+                )
+            except (TypeError, ValueError):
+                _plan_gpus = 1
+            _plan_bs = max(1, _plan_bs)
+            probe_bs = max(1, int(probe_batch))
+            num = _plan_bs * _gas_lr * _plan_gpus
+            den = probe_bs * _gas_lr * 1
+            if den > 0 and math.isfinite(num):
+                ratio = num / den
+                if math.isfinite(ratio) and ratio > 0:
+                    best_lr_out = best_lr_raw * ratio
+                    _scale_msg = (
+                        f"  linear_batch_scale={ratio:.4g} "
+                        f"(eff_batch planned={_plan_bs}×gas={_gas_lr}×{_plan_gpus}gpu "
+                        f"vs probe={probe_bs}×gas={_gas_lr}×1gpu; "
+                        f"lr_probe={best_lr_raw:.2e} → lr={best_lr_out:.2e})"
+                    )
 
         train_batch = min(b_train, probe_batch)
         if _cap_bs is not None and _cap_bs >= 1:
@@ -1290,19 +1833,26 @@ def find_lr(
             else f"min(B_train, probe)={train_batch}"
         )
         print(
-            f"[LR Finder] Selected LR: {best_lr:.2e}  "
+            f"[LR Finder] Selected LR: {best_lr_out:.2e}  "
             f"(probe batch_size={probe_batch}; B_train={b_train}; "
-            f"training batch_size={_tb_desc})",
+            f"training batch_size={_tb_desc})"
+            f"{_scale_msg}",
             flush=True,
         )
         return {
-            "lr": best_lr,
+            "lr": best_lr_out,
+            "lr_mini_train_probe": best_lr_raw,
+            "linear_lr_batch_scale_applied": bool(_scale_msg),
             "batch_size": train_batch,
             "b_max_synthetic": b_max,
             "b_train_synthetic": b_train_syn,
             "probe_batch_real_data": probe_batch,
             "lr_probe_points": _points,
             "mini_train_batches": _mini_b,
+            "gradient_accumulation_steps": _gas_lr,
+            "samples_per_lr": _samples_plr,
+            "lr_pick_mode": _lr_pick_mode,
+            "pick_segment_pick_frac": _pick_seg_frac,
         }
 
     except Exception as exc:

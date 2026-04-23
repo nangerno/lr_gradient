@@ -2,6 +2,7 @@ import os
 from typing import Optional
 
 from lr_finder import find_lr
+from lr_finder_tasks import LR_TASK_DPO, LR_TASK_GRPO, normalize_lr_finder_task
 
 
 def effective_lr_finder_seq_len(train_info: dict, default: int = 1024) -> int:
@@ -17,6 +18,23 @@ def effective_lr_finder_seq_len(train_info: dict, default: int = 1024) -> int:
     return default
 
 
+def effective_lr_finder_probe_seq_len(train_info: dict) -> int:
+    """
+    Sequence length used to pad/collate LR mini-train batches.
+
+    Defaults to the same value as ``effective_lr_finder_seq_len`` (training
+    ``max_length`` / ``lr_finder_seq_len``) so the probe matches real tokenized
+    batches. Set ``lr_finder_probe_seq_len`` explicitly to use a shorter probe.
+    """
+    raw = train_info.get("lr_finder_probe_seq_len")
+    if raw is None:
+        return effective_lr_finder_seq_len(train_info)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return effective_lr_finder_seq_len(train_info)
+
+
 def resolve_tokenized_train_path(train_info: dict) -> Optional[str]:
     """Resolve ``train_tokenized_*.json``: explicit path, or ``datasets/train_tokenized_{task_id}.json``."""
     tokenized_train_path = train_info.get("tokenized_train_path")
@@ -28,6 +46,26 @@ def resolve_tokenized_train_path(train_info: dict) -> Optional[str]:
     return tokenized_train_path or None
 
 
+def resolve_lr_finder_dataset_path(train_info: dict, run_config: dict) -> Optional[str]:
+    """
+    Path used by ``find_lr`` for mini-train: instruct → ``train_tokenized_*.json``;
+    DPO → ``dpo_train_*.json``; GRPO → ``grpo_train_*.json``.
+    """
+    task_id = train_info.get("task_id") or ""
+    task = normalize_lr_finder_task(run_config.get("lr_finder_task", "instruct"))
+    if task == LR_TASK_DPO:
+        candidate = os.path.join("datasets", f"dpo_train_{task_id}.json")
+    elif task == LR_TASK_GRPO:
+        candidate = os.path.join("datasets", f"grpo_train_{task_id}.json")
+    else:
+        return resolve_tokenized_train_path(train_info)
+    return candidate if os.path.isfile(candidate) else None
+
+
+def is_lr_finder_runnable(train_info: dict, run_config: dict) -> bool:
+    return resolve_lr_finder_dataset_path(train_info, run_config) is not None
+
+
 def apply_tokenized_lr_finder_to_run_config(
     run_config: dict,
     train_info: dict,
@@ -36,49 +74,48 @@ def apply_tokenized_lr_finder_to_run_config(
     num_params: Optional[int],
     *,
     fallback_learning_rate: float,
-    grpo_slow_reward_proxy_probe: bool = False,
 ) -> None:
     dataset_type_dict = dict(train_info.get("dataset_type", {}))
     tokenized_train_path = resolve_tokenized_train_path(train_info)
     if tokenized_train_path:
         dataset_type_dict["tokenized_train_path"] = tokenized_train_path
 
-    dataset_type_dict["lr_finder_peak_rel_slack"] = float(
-        run_config.get("lr_finder_peak_rel_slack", 0.28)
-    )
-    dataset_type_dict["lr_finder_min_probe_rows"] = int(
-        run_config.get("lr_finder_min_probe_rows", 32)
-    )
-    dataset_type_dict["lr_finder_probe_fraction"] = float(
-        run_config.get("lr_finder_probe_fraction", 0.02)
-    )
-    dataset_type_dict["lr_finder_target_tokens_min"] = int(
-        run_config.get("lr_finder_target_tokens_min", 50_000)
-    )
-    dataset_type_dict["lr_finder_target_tokens_max"] = int(
-        run_config.get("lr_finder_target_tokens_max", 200_000)
-    )
-    dataset_type_dict["lr_finder_probe_seq_len"] = int(
-        run_config.get("lr_finder_probe_seq_len", 512)
-    )
-    _bcap = run_config.get("lr_finder_b_train_cap", 2)
-    try:
-        dataset_type_dict["lr_finder_b_train_cap"] = int(_bcap) if _bcap is not None else 2
-    except (TypeError, ValueError):
-        dataset_type_dict["lr_finder_b_train_cap"] = 2
-    dataset_type_dict["lr_finder_tight_after_job_kill"] = bool(
-        run_config.get("lr_finder_tight_after_job_kill", False)
-    )
-    try:
-        _qis = run_config.get("lr_finder_quadratic_interp_steps", 10)
-        _qis_i = int(_qis) if _qis is not None else 10
-    except (TypeError, ValueError):
-        _qis_i = 10
-    dataset_type_dict["lr_finder_quadratic_interp_steps"] = max(0, _qis_i)
+    # ``run_config`` is the canonical training JSON; mirror all ``lr_finder_*`` keys.
+    for rk, rv in run_config.items():
+        if rk.startswith("lr_finder_") and rv is not None:
+            dataset_type_dict[rk] = rv
 
-    if not is_instruct_lr_finder_runnable(tokenized_train_path):
+    dataset_type_dict["lr_finder_use_lora"] = bool(run_config.get("use_lora", False))
+    try:
+        if run_config.get("max_grad_norm") is not None:
+            dataset_type_dict["lr_finder_max_grad_norm"] = float(run_config["max_grad_norm"])
+    except (TypeError, ValueError):
+        pass
+    if "lr_finder_gradient_checkpointing" not in dataset_type_dict:
+        dataset_type_dict["lr_finder_gradient_checkpointing"] = bool(
+            run_config.get("gradient_checkpointing", True)
+        )
+
+    _lr_seq = int(run_config.get("lr_finder_seq_len", 1024))
+    if "lr_finder_probe_seq_len" not in dataset_type_dict:
+        dataset_type_dict["lr_finder_probe_seq_len"] = int(
+            run_config.get("lr_finder_probe_seq_len", _lr_seq)
+        )
+
+    _task = normalize_lr_finder_task(run_config.get("lr_finder_task", "instruct"))
+    if _task == LR_TASK_GRPO and run_config.get("max_completion_length") is not None:
+        dataset_type_dict["max_completion_length"] = int(run_config["max_completion_length"])
+    if _task == LR_TASK_DPO and run_config.get("beta") is not None:
+        try:
+            dataset_type_dict["lr_finder_dpo_beta"] = float(run_config["beta"])
+        except (TypeError, ValueError):
+            pass
+
+    lr_dataset_path = resolve_lr_finder_dataset_path(train_info, run_config)
+    if not is_lr_finder_runnable(train_info, run_config):
         print(
-            "[LR Finder] Skipping: no train_tokenized JSON; using param-based LR and batch.",
+            "[LR Finder] Skipping: no dataset file for this task (see lr_finder_task / tokenize output); "
+            "using param-based LR and batch.",
             flush=True,
         )
         return
@@ -92,21 +129,46 @@ def apply_tokenized_lr_finder_to_run_config(
     if _planned_bs is not None and _planned_bs < 1:
         _planned_bs = None
 
+    try:
+        dataset_type_dict["lr_finder_gradient_accumulation_steps"] = max(
+            1, int(run_config.get("gradient_accumulation_steps", 1))
+        )
+    except (TypeError, ValueError):
+        dataset_type_dict["lr_finder_gradient_accumulation_steps"] = 1
+    try:
+        dataset_type_dict["lr_finder_planned_gpu_nums"] = max(1, int(run_config.get("gpu_nums", 1)))
+    except (TypeError, ValueError):
+        dataset_type_dict["lr_finder_planned_gpu_nums"] = 1
+    if _planned_bs is not None:
+        dataset_type_dict["lr_finder_planned_per_device_batch_size"] = int(_planned_bs)
+    dataset_type_dict["lr_finder_linear_scale_lr_to_effective_batch"] = bool(
+        run_config.get("lr_finder_linear_scale_lr_to_effective_batch", False)
+    )
+
+    try:
+        _lr_min = float(run_config.get("lr_finder_min_lr", 1e-6))
+    except (TypeError, ValueError):
+        _lr_min = 1e-6
+    try:
+        _lr_max = float(run_config.get("lr_finder_max_lr", 9e-3))
+    except (TypeError, ValueError):
+        _lr_max = 9e-3
+
     lr_result = get_instruct_lr(
         model_id,
         model_path,
         num_params,
         dataset_type_dict,
-        tokenized_dataset_path=tokenized_train_path,
+        tokenized_dataset_path=lr_dataset_path,
         seq_len=run_config["lr_finder_seq_len"],
         lr_probe_points=run_config["lr_finder_lr_probe_points"],
         mini_train_batches=run_config["lr_finder_mini_train_batches"],
         optimizer_name=run_config["optimizer"],
-        lr_sample_stratify=run_config["lr_finder_stratify_length"],
         lr_sample_seed=run_config["lr_finder_sample_seed"],
         batch_headroom=run_config["lr_finder_batch_headroom"],
-        grpo_slow_reward_proxy_probe=grpo_slow_reward_proxy_probe,
         max_lr_probe_batch=_planned_bs,
+        min_lr=_lr_min,
+        max_lr=_lr_max,
     )
 
     if lr_result is not None:
@@ -114,7 +176,7 @@ def apply_tokenized_lr_finder_to_run_config(
         bs = lr_result.get("batch_size")
 
         if lr is not None:
-            print(f"Using lr from finder (2% tokenized probe): {lr}", flush=True)
+            print(f"Using lr from finder (task={_task} mini-train dataset): {lr}", flush=True)
             run_config["learning_rate"] = lr
         else:
             print(
@@ -139,11 +201,6 @@ def is_dataset_available_for_lr_finder(dataset_path: Optional[str]) -> bool:
     return bool(dataset_path and str(dataset_path).strip())
 
 
-def is_instruct_lr_finder_runnable(tokenized_train_path: Optional[str]) -> bool:
-    """LR finder runs only on ``train_tokenized_*.json`` (2% sample + safety batch)."""
-    return bool(tokenized_train_path and os.path.isfile(tokenized_train_path))
-
-
 def get_instruct_lr(
     model_id: str,
     model_path: str,
@@ -153,13 +210,13 @@ def get_instruct_lr(
     tokenized_dataset_path: str,
     seq_len: int = 1024,
     lr_probe_points: int = 28,
-    mini_train_batches: int = 1,
+    mini_train_batches: int = 20,
     optimizer_name: Optional[str] = None,
-    lr_sample_stratify: bool = True,
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
-    grpo_slow_reward_proxy_probe: bool = False,
     max_lr_probe_batch: Optional[int] = None,
+    min_lr: float = 1e-6,
+    max_lr: float = 9e-3,
 ) -> Optional[dict]:
     if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         return None
@@ -169,15 +226,13 @@ def get_instruct_lr(
         num_params,
         tokenized_dataset_path,
         dataset_type_dict,
-        min_lr=1e-6,
-        max_lr=9e-3,
+        min_lr=min_lr,
+        max_lr=max_lr,
         lr_probe_points=lr_probe_points,
         mini_train_batches=mini_train_batches,
         seq_len=seq_len,
         optimizer_name=optimizer_name,
-        lr_sample_stratify=lr_sample_stratify,
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
-        grpo_slow_reward_proxy_probe=grpo_slow_reward_proxy_probe,
         max_lr_probe_batch=max_lr_probe_batch,
     )
