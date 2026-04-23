@@ -5,7 +5,7 @@ import math
 import os
 import random
 import tempfile
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -286,31 +286,33 @@ def _trainable_params(model) -> list[torch.nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
 
+_LR_FINDER_PROBE_OPTIM_NOTICE = False
+
+
 def _make_optimizer(
     model,
     lr: float,
     optimizer_name: Optional[str],
     weight_decay: float = 0.0,
 ):
-    """AdamW (or PagedAdamW8bit when training uses it)."""
+    """
+    LR mini-train probes always use ``torch.optim.AdamW``.
+
+    Training may use PagedAdamW8bit, but that optimizer **pages state to host RAM**;
+    creating it dozens of times across the LR grid spikes cgroup memory and the Linux
+    OOM killer often SIGKILLs the process (``Killed`` with no Python traceback).
+    """
+    global _LR_FINDER_PROBE_OPTIM_NOTICE
     params = _trainable_params(model)
     key = (optimizer_name or "adamw_torch").lower().replace("-", "_")
-    if key in ("paged_adamw_8bit", "pagedadamw8bit"):
-        try:
-            import bitsandbytes as bnb
-
-            return bnb.optim.PagedAdamW8bit(
-                params,
-                lr=lr,
-                betas=(0.9, 0.999),
-                eps=1e-8,
-                weight_decay=weight_decay,
-            )
-        except Exception as exc:
-            print(
-                f"[LR Finder] PagedAdamW8bit unavailable ({exc}); using AdamW.",
-                flush=True,
-            )
+    if key in ("paged_adamw_8bit", "pagedadamw8bit") and not _LR_FINDER_PROBE_OPTIM_NOTICE:
+        print(
+            "[LR Finder] Mini-train probes use torch AdamW (PagedAdamW8bit skipped here "
+            "to avoid host-RAM OOM kills across many LR steps). Full training still uses "
+            "your configured optimizer.",
+            flush=True,
+        )
+        _LR_FINDER_PROBE_OPTIM_NOTICE = True
     return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
@@ -368,11 +370,160 @@ def _mini_train_mean_loss(
             torch.cuda.empty_cache()
 
 
-def _load_trainable_checkpoint(path: str) -> dict:
+def _synthetic_lm_batch(tokenizer, batch_size: int, seq_len: int, device: str) -> dict[str, torch.Tensor]:
+    """Random integer tokens on ``device`` (same layout as tokenized mini-train)."""
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        vocab_size = int(len(tokenizer))
+    ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    attn = torch.ones_like(ids)
+    labels = ids.clone()
+    return {"input_ids": ids, "attention_mask": attn, "labels": labels}
+
+
+def _lr_finder_cap_batch_with_optimizer_probe(
+    model,
+    tokenizer,
+    *,
+    seq_len: int,
+    device: str,
+    optimizer_name: Optional[str],
+    synthetic_b_train: int,
+) -> int:
+    """
+    ``find_max_batch_size`` only checks forward + backward (no optimizer states).
+    LR search runs the same pattern as ``_mini_train_mean_loss`` (Adam + ``step()`` +
+    eval forward). Shrink batch until that fits so the grid starts at a safe size.
+    """
+    cap = max(1, int(synthetic_b_train))
+    if device != "cuda" or not torch.cuda.is_available():
+        return cap
+
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if not trainable:
+        return cap
+
+    total_trainable_bytes = sum(p.numel() * p.element_size() for _, p in trainable)
+    ckpt_path: Optional[str] = None
+    cpu_snapshot: Optional[dict[str, torch.Tensor]] = None
+    if total_trainable_bytes > _SNAPSHOT_DISK_THRESHOLD_BYTES:
+        fd, ckpt_path = tempfile.mkstemp(prefix="lr_finder_optim_probe_", suffix=".pt")
+        os.close(fd)
+        with torch.no_grad():
+            torch.save({n: p.detach().cpu() for n, p in trainable}, ckpt_path)
+    else:
+        with torch.no_grad():
+            cpu_snapshot = {n: p.detach().cpu().clone() for n, p in trainable}
+
+    def _restore_trainable_weights() -> None:
+        with torch.no_grad():
+            if ckpt_path is not None:
+                blob = _load_trainable_checkpoint(ckpt_path)
+                try:
+                    for name, param in model.named_parameters():
+                        if name in blob:
+                            param.copy_(
+                                blob[name].to(
+                                    device=param.device,
+                                    dtype=param.dtype,
+                                    non_blocking=True,
+                                )
+                            )
+                finally:
+                    del blob
+            else:
+                assert cpu_snapshot is not None
+                for name, param in model.named_parameters():
+                    if name in cpu_snapshot:
+                        param.copy_(
+                            cpu_snapshot[name].to(
+                                device=param.device,
+                                dtype=param.dtype,
+                                non_blocking=True,
+                            )
+                        )
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    b = cap
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+        while b >= 1:
+            optimizer: Any = None
+            try:
+                _restore_trainable_weights()
+                inputs = _synthetic_lm_batch(tokenizer, b, seq_len, device)
+                optimizer = _make_optimizer(model, 1e-6, optimizer_name)
+                trainable_params = _trainable_params(model)
+                model.train()
+                optimizer.zero_grad()
+                with _bf16_autocast(device):
+                    loss = model(**inputs).loss
+                if not torch.isfinite(loss):
+                    raise RuntimeError("non-finite loss in LR finder optimizer probe")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
+                model.eval()
+                with torch.no_grad():
+                    with _bf16_autocast(device):
+                        loss_after = model(**inputs).loss
+                model.train()
+                if not torch.isfinite(loss_after):
+                    raise RuntimeError("non-finite post-step loss in LR finder optimizer probe")
+            except RuntimeError as exc:
+                _restore_trainable_weights()
+                msg = str(exc).lower()
+                if "out of memory" in msg or "non-finite" in msg:
+                    if optimizer is not None:
+                        del optimizer
+                        optimizer = None
+                    gc.collect()
+                    if device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if b <= 1:
+                        return 1
+                    b //= 2
+                    continue
+                raise
+            finally:
+                if optimizer is not None:
+                    del optimizer
+                gc.collect()
+                if device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            _restore_trainable_weights()
+            return b
+
+        return 1
+    finally:
+        if cpu_snapshot is not None:
+            del cpu_snapshot
+        if ckpt_path is not None:
+            try:
+                os.remove(ckpt_path)
+            except OSError:
+                pass
+        gc.collect()
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _load_trainable_checkpoint(path: str) -> dict:
+    """
+    Prefer ``mmap=True`` when supported so restoring large FT checkpoints does not
+    allocate a full second copy of all tensors in host RAM at once.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except (TypeError, OSError):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
 
 
 def _run_mini_train_lr_grid(
@@ -888,6 +1039,7 @@ def find_lr(
     batch_headroom: float = 0.8,
     grpo_slow_reward_proxy_probe: bool = False,
     peak_rel_slack: float = 0.28,
+    max_lr_probe_batch: Optional[int] = None,
 ) -> Optional[dict]:
     if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         print(
@@ -1030,7 +1182,7 @@ def find_lr(
             "[LR Finder] Probing max batch size (synthetic seq_len=probe) …",
             flush=True,
         )
-        b_max, b_train = find_max_batch_size(
+        b_max, b_train_syn = find_max_batch_size(
             model,
             tokenizer,
             seq_len=effective_probe_seq,
@@ -1038,14 +1190,42 @@ def find_lr(
             headroom=_hr,
             b_train_cap=_b_train_cap,
         )
+        b_train = _lr_finder_cap_batch_with_optimizer_probe(
+            model,
+            tokenizer,
+            seq_len=effective_probe_seq,
+            device=device,
+            optimizer_name=optimizer_name,
+            synthetic_b_train=b_train_syn,
+        )
         _bmsg = f"headroom={_hr:g}"
         if _b_train_cap:
             _bmsg += f"  B_train_cap={_b_train_cap}"
+        if b_train < b_train_syn:
+            print(
+                f"[LR Finder] Optimizer + mini-train probe capped batch: "
+                f"synthetic B_train={b_train_syn} → {b_train}",
+                flush=True,
+            )
         print(
             f"[LR Finder] B_max={b_max}  B_train={b_train}  ({_bmsg})",
             flush=True,
         )
         safe_batch = b_train
+        _cap_bs: Optional[int] = None
+        if max_lr_probe_batch is not None:
+            try:
+                _cap_bs = int(max_lr_probe_batch)
+            except (TypeError, ValueError):
+                _cap_bs = None
+            if _cap_bs is not None and _cap_bs >= 1:
+                if safe_batch > _cap_bs:
+                    print(
+                        "[LR Finder] Capping LR mini-train batch by run_config batch_size="
+                        f"{_cap_bs} (synthetic B_train={b_train} → safe_batch={_cap_bs})",
+                        flush=True,
+                    )
+                safe_batch = min(safe_batch, _cap_bs)
 
         _strat = _config_bool_or_default(
             dataset_type_dict.get("lr_finder_stratify_length"),
@@ -1102,17 +1282,24 @@ def find_lr(
         )
 
         train_batch = min(b_train, probe_batch)
+        if _cap_bs is not None and _cap_bs >= 1:
+            train_batch = min(train_batch, _cap_bs)
+        _tb_desc = (
+            f"min(B_train, probe, run_config batch_size cap)={train_batch}"
+            if _cap_bs is not None and _cap_bs >= 1
+            else f"min(B_train, probe)={train_batch}"
+        )
         print(
             f"[LR Finder] Selected LR: {best_lr:.2e}  "
             f"(probe batch_size={probe_batch}; B_train={b_train}; "
-            f"training batch_size=min(B_train, probe)={train_batch})",
+            f"training batch_size={_tb_desc})",
             flush=True,
         )
         return {
             "lr": best_lr,
             "batch_size": train_batch,
             "b_max_synthetic": b_max,
-            "b_train_synthetic": b_train,
+            "b_train_synthetic": b_train_syn,
             "probe_batch_real_data": probe_batch,
             "lr_probe_points": _points,
             "mini_train_batches": _mini_b,

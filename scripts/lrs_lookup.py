@@ -83,6 +83,15 @@ def apply_tokenized_lr_finder_to_run_config(
         )
         return
 
+    _planned_bs: Optional[int] = None
+    _raw_bs = run_config.get("batch_size")
+    try:
+        _planned_bs = int(_raw_bs) if _raw_bs is not None else None
+    except (TypeError, ValueError):
+        _planned_bs = None
+    if _planned_bs is not None and _planned_bs < 1:
+        _planned_bs = None
+
     lr_result = get_instruct_lr(
         model_id,
         model_path,
@@ -97,6 +106,7 @@ def apply_tokenized_lr_finder_to_run_config(
         lr_sample_seed=run_config["lr_finder_sample_seed"],
         batch_headroom=run_config["lr_finder_batch_headroom"],
         grpo_slow_reward_proxy_probe=grpo_slow_reward_proxy_probe,
+        max_lr_probe_batch=_planned_bs,
     )
 
     if lr_result is not None:
@@ -149,6 +159,7 @@ def get_instruct_lr(
     lr_sample_seed: int = 42,
     batch_headroom: float = 0.8,
     grpo_slow_reward_proxy_probe: bool = False,
+    max_lr_probe_batch: Optional[int] = None,
 ) -> Optional[dict]:
     if not tokenized_dataset_path or not os.path.isfile(tokenized_dataset_path):
         return None
@@ -168,4 +179,5 @@ def get_instruct_lr(
         lr_sample_seed=lr_sample_seed,
         batch_headroom=batch_headroom,
         grpo_slow_reward_proxy_probe=grpo_slow_reward_proxy_probe,
+        max_lr_probe_batch=max_lr_probe_batch,
     )
