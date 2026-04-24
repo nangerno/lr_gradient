@@ -2,11 +2,11 @@
 import torch
 import torch.nn.functional as F
 import transformers
-from typing import Optional
 import sys
-import random 
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
 from torch.utils.data import Dataset
-from typing import Any, Dict, List, Tuple
 
 
 def get_max_seqlen_in_batch(attention_mask):
@@ -123,15 +123,23 @@ def pack_data_points_FA(
     lengths = []
     label_ids = []
     attention_mask = []
+    # Packed masks use 1,2,3,... per segment for flash-attn varlen. OPT (and similar
+    # models) derive position_ids as cumsum(attention_mask), which is only valid for
+    # binary 0/1 masks — cumsum of segment ids explodes past max_position_embeddings.
+    # Supply explicit positions: 0..L-1 within each segment, -1 on pad (OPT embed convention).
+    position_ids = []
 
     for index, item in enumerate(data_points):
+        L = len(item["input_ids"])
         input_ids += item["input_ids"]
         # assert item["labels"][0] == -100 # This is to make sure that the first token won't be included in computing loss
         labels = list(item["labels"])
         labels[0] = -100
         label_ids += labels
-        lengths.append(len(item["input_ids"]))
-        attention_mask += [index + 1 for _ in range(len(item["input_ids"]))]
+        lengths.append(L)
+        seg_marker = index + 1
+        attention_mask += [seg_marker] * L
+        position_ids += list(range(L))
 
     pad_leng = model_max_length - len(input_ids)  # padding to model_max_length
 
@@ -139,18 +147,27 @@ def pack_data_points_FA(
         input_ids = input_ids + [tokenizer.pad_token_id for _ in range(pad_leng)]
         label_ids = label_ids + [-100 for _ in range(pad_leng)]
         attention_mask = attention_mask + [0 for _ in range(pad_leng)]
+        position_ids = position_ids + [-1 for _ in range(pad_leng)]
     else:
         input_ids = [tokenizer.pad_token_id for _ in range(pad_leng)] + input_ids
         label_ids = [-100 for _ in range(pad_leng)] + label_ids
         attention_mask = [0 for _ in range(pad_leng)] + attention_mask
+        position_ids = [-1 for _ in range(pad_leng)] + position_ids
 
-    assert len(input_ids) == len(label_ids) == len(attention_mask) == model_max_length
+    assert (
+        len(input_ids)
+        == len(label_ids)
+        == len(attention_mask)
+        == len(position_ids)
+        == model_max_length
+    )
     return {
         "input_ids": torch.tensor(input_ids),
         "labels": torch.tensor(label_ids),
         "attention_mask": torch.tensor(
             attention_mask
         ),  # unsqueeze <-- because the shape is: B x 1 x N x N
+        "position_ids": torch.tensor(position_ids),
     }
     
 

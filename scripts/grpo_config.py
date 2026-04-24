@@ -293,10 +293,23 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
     if _slow_reward_funcs:
         train_request["save_before_remaining_time"] = 12
         run_config["batch_size"] = _slow_reward_bs_from_param_nums(param_nums)
-        run_config["max_completion_length"] = 128
+        # Was hardcoded 128; shorter completions speed up rollouts + rewards.
+        # Override via dataset_type or train_info: "max_completion_length": 64
+        _dt = train_info.get("dataset_type") or {}
+        _slow_mcl = _dt.get("max_completion_length", train_info.get("max_completion_length"))
+        if _slow_mcl is not None:
+            try:
+                _slow_mcl_i = int(_slow_mcl)
+            except (TypeError, ValueError):
+                _slow_mcl_i = 80
+            _slow_mcl_i = max(16, min(_slow_mcl_i, 512))
+        else:
+            _slow_mcl_i = 80
+        run_config["max_completion_length"] = _slow_mcl_i
         print(
             "Slow reward functions (e.g. textstat/langcheck/detoxify): "
-            "max_completion_length=128 to shorten generation and reward cost.",
+            f"max_completion_length={_slow_mcl_i} to shorten generation and reward cost "
+            "(set dataset_type max_completion_length to override; default 80).",
             flush=True,
         )
 

@@ -176,7 +176,7 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             train_info.get("lr_finder_pick_explosion_step_ratio", 1.5)
         ),
         "lr_finder_pick_segment_pick_frac": float(
-            train_info.get("lr_finder_pick_segment_pick_frac", 0.4)
+            train_info.get("lr_finder_pick_segment_pick_frac", 0.7)
         ),
         "lr_finder_seq_len": effective_lr_finder_seq_len(train_info),
         "lr_finder_probe_seq_len": effective_lr_finder_probe_seq_len(train_info),

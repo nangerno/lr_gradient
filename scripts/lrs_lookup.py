@@ -1,11 +1,41 @@
 import os
+from pathlib import Path
 from typing import Optional
 
 from lr_finder import find_lr
 from lr_finder_tasks import LR_TASK_DPO, LR_TASK_GRPO, normalize_lr_finder_task
 
+# When ``train_info`` omits ``max_length`` / ``lr_finder_seq_len``, match ``train_instruct``
+# default (``test_axolotl.yml`` ``sequence_len``) so LR probes see the same max length
+# as training (e.g. 2048), not a shorter 1024 window.
+_DEFAULT_LR_FINDER_SEQ_FALLBACK = 2048
 
-def effective_lr_finder_seq_len(train_info: dict, default: int = 1024) -> int:
+
+def _sequence_len_from_test_axolotl_yml() -> Optional[int]:
+    """Same default path as ``train_instruct.get_max_length_config`` (``scripts/test_axolotl.yml``)."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    cfg = Path(__file__).resolve().parent / "test_axolotl.yml"
+    if not cfg.is_file():
+        return None
+    try:
+        with open(cfg, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            return None
+        sl = data.get("sequence_len")
+        if sl is None:
+            return None
+        return max(1, int(sl))
+    except (OSError, TypeError, ValueError):
+        return None
+    except yaml.YAMLError:
+        return None
+
+
+def effective_lr_finder_seq_len(train_info: dict, default: int = _DEFAULT_LR_FINDER_SEQ_FALLBACK) -> int:
     if train_info.get("lr_finder_seq_len") is not None:
         return max(1, int(train_info["lr_finder_seq_len"]))
     ml = train_info.get("max_length")
@@ -15,16 +45,20 @@ def effective_lr_finder_seq_len(train_info: dict, default: int = 1024) -> int:
         ml_int = -1
     if ml_int > 0:
         return ml_int
-    return default
+    from_yaml = _sequence_len_from_test_axolotl_yml()
+    if from_yaml is not None:
+        return from_yaml
+    return max(1, int(default))
 
 
 def effective_lr_finder_probe_seq_len(train_info: dict) -> int:
     """
     Sequence length used to pad/collate LR mini-train batches.
 
-    Defaults to the same value as ``effective_lr_finder_seq_len`` (training
-    ``max_length`` / ``lr_finder_seq_len``) so the probe matches real tokenized
-    batches. Set ``lr_finder_probe_seq_len`` explicitly to use a shorter probe.
+    Defaults to the same value as ``effective_lr_finder_seq_len`` (``train_info``
+    ``max_length`` / ``lr_finder_seq_len``, else ``test_axolotl.yml`` ``sequence_len``,
+    else 2048) so the probe matches real training length. Set
+    ``lr_finder_probe_seq_len`` explicitly for a shorter, cheaper probe.
     """
     raw = train_info.get("lr_finder_probe_seq_len")
     if raw is None:
@@ -96,7 +130,7 @@ def apply_tokenized_lr_finder_to_run_config(
             run_config.get("gradient_checkpointing", True)
         )
 
-    _lr_seq = int(run_config.get("lr_finder_seq_len", 1024))
+    _lr_seq = int(run_config.get("lr_finder_seq_len", _DEFAULT_LR_FINDER_SEQ_FALLBACK))
     if "lr_finder_probe_seq_len" not in dataset_type_dict:
         dataset_type_dict["lr_finder_probe_seq_len"] = int(
             run_config.get("lr_finder_probe_seq_len", _lr_seq)
@@ -208,7 +242,7 @@ def get_instruct_lr(
     dataset_type_dict: dict,
     *,
     tokenized_dataset_path: str,
-    seq_len: int = 1024,
+    seq_len: int = _DEFAULT_LR_FINDER_SEQ_FALLBACK,
     lr_probe_points: int = 28,
     mini_train_batches: int = 20,
     optimizer_name: Optional[str] = None,
