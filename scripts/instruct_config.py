@@ -8,6 +8,7 @@ from model_utility import (
 from copy import deepcopy
 from lrs_lookup import (
     apply_tokenized_lr_finder_to_run_config,
+    apply_training_lr_scaling_after_lr_finder,
     effective_lr_finder_probe_seq_len,
     effective_lr_finder_seq_len,
 )
@@ -156,15 +157,15 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "lr_finder_lr_probe_points": int(
             train_info.get(
                 "lr_finder_lr_probe_points",
-                train_info.get("lr_finder_steps", 28),
+                train_info.get("lr_finder_steps", 12),
             )
         ),
         "lr_finder_mini_train_batches": int(
-            train_info.get("lr_finder_mini_train_batches", 20)
+            train_info.get("lr_finder_mini_train_batches", 6)
         ),
-        "lr_finder_samples_per_lr": int(train_info.get("lr_finder_samples_per_lr", 80)),
+        "lr_finder_samples_per_lr": int(train_info.get("lr_finder_samples_per_lr", 24)),
         "lr_finder_lr_pick_mode": str(
-            train_info.get("lr_finder_lr_pick_mode", "descending_segment")
+            train_info.get("lr_finder_lr_pick_mode", "torch_lr_finder")
         ),
         "lr_finder_pick_trim_low_lr_frac": float(
             train_info.get("lr_finder_pick_trim_low_lr_frac", 0.2)
@@ -179,7 +180,12 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             train_info.get("lr_finder_pick_segment_pick_frac", 0.7)
         ),
         "lr_finder_seq_len": effective_lr_finder_seq_len(train_info),
-        "lr_finder_probe_seq_len": effective_lr_finder_probe_seq_len(train_info),
+        "lr_finder_probe_seq_len": int(
+            train_info.get(
+                "lr_finder_probe_seq_len",
+                min(effective_lr_finder_probe_seq_len(train_info), 1024),
+            )
+        ),
         "lr_finder_b_train_cap": int(train_info.get("lr_finder_b_train_cap", 0)),
         "lr_finder_sample_seed": int(train_info.get("lr_finder_sample_seed", 42)),
         "lr_finder_batch_headroom": float(train_info.get("lr_finder_batch_headroom", 0.8)),
@@ -222,7 +228,7 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             fallback_learning_rate=_lr_from_param_nums(param_nums),
         )
 
-    run_config["learning_rate"] *= train_info["reg_ratio"]
+    apply_training_lr_scaling_after_lr_finder(run_config, train_info)
 
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
 

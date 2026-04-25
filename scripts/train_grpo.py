@@ -107,6 +107,25 @@ def print_trainable_parameters(model):
     )
 
 
+def _log_trainable_param_sanity(model) -> None:
+    """
+    Fast sanity check for “is anything actually updating?” issues.
+
+    GRPOTrainer logs can show ``loss=0`` / ``grad_norm=0`` in some setups even when
+    rewards are computed; this makes trainability obvious in plain text logs.
+    """
+    trainable_tensors = [p for p in model.parameters() if p.requires_grad]
+    n_train = len(trainable_tensors)
+    n_elems = sum(int(p.numel()) for p in trainable_tensors)
+    log_info(
+        f"[GRPO sanity] trainable_parameter_tensors={n_train}  trainable_elements={n_elems:,d}"
+    )
+    if n_train == 0 or n_elems == 0:
+        log_info(
+            "[GRPO sanity] WARNING: zero trainable parameters — optimizer updates will be a no-op."
+        )
+
+
 def get_max_length_config():
     config_path = "test_axolotl.yml"
     with open(config_path, "r") as file:
@@ -404,6 +423,8 @@ def main():
         model = PeftModelForCausalLM.from_pretrained(
             model, train_request["lora_model"], is_trainable=True, **model_kwargs
         )
+
+    _log_trainable_param_sanity(model)
 
     if peft_config is None:  # this is full-weight training
         # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models

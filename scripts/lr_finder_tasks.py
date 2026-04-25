@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import torch
@@ -23,6 +23,24 @@ from torch.utils.data import DataLoader
 LR_TASK_INSTRUCT = "instruct"
 LR_TASK_DPO = "dpo"
 LR_TASK_GRPO = "grpo"
+
+
+def _load_trainable_checkpoint_cpu(path: str) -> dict[str, torch.Tensor]:
+    """
+    Load a ``{param_name: tensor}`` checkpoint onto CPU.
+
+    Prefer ``mmap=True`` when supported (large full fine-tunes).
+    """
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except (TypeError, OSError):
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            blob = torch.load(path, map_location="cpu")
+    if not isinstance(blob, dict):
+        raise TypeError("trainable checkpoint must be a dict[str, Tensor]")
+    return blob
 
 
 def normalize_lr_finder_task(raw: Any) -> str:
@@ -154,6 +172,7 @@ def dpo_sigmoid_loss(
     batch: dict[str, torch.Tensor],
     *,
     beta: float,
+    ref_trainable_cpu: Optional[Union[dict[str, torch.Tensor], str]] = None,
 ) -> torch.Tensor:
     """TRL DPO sigmoid loss (reverse KL), PEFT-ref via ``disable_adapter`` when applicable."""
     from peft import PeftModel
@@ -163,26 +182,86 @@ def dpo_sigmoid_loss(
         "attention_mask": batch["attention_mask"],
         "use_cache": False,
     }
-    outputs = model(**model_kwargs)
     input_ids = batch["input_ids"]
     completion_mask = batch["completion_mask"]
-    shift_logits = outputs.logits[..., :-1, :].contiguous()
     shift_labels = input_ids[..., 1:].contiguous()
     shift_cm = completion_mask[..., 1:].contiguous()
-    per_token = selective_log_softmax(shift_logits, shift_labels)
-    per_token = per_token * shift_cm
-    logps = per_token.sum(dim=-1)
 
-    with torch.no_grad():
-        if isinstance(model, PeftModel):
+    # π_ref must be computed without mutating trainable tensors *after* the policy forward,
+    # otherwise in-place weight replay (copy_) invalidates autograd on lm_head / embeddings.
+    # PEFT: adapter forward is separate from disable_adapter ref forward — safe after policy.
+    # Full-FT snapshot: do weight-replay ref *first*, then policy forward for gradients.
+    ref_logps: torch.Tensor
+    if isinstance(model, PeftModel):
+        outputs = model(**model_kwargs)
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        per_token = selective_log_softmax(shift_logits, shift_labels)
+        per_token = per_token * shift_cm
+        logps = per_token.sum(dim=-1)
+        with torch.no_grad():
             with model.disable_adapter():
                 ref_out = model(**model_kwargs)
-        else:
+            ref_shift = ref_out.logits[..., :-1, :].contiguous()
+            ref_per = selective_log_softmax(ref_shift, shift_labels)
+            ref_per = ref_per * shift_cm
+            ref_logps = ref_per.sum(dim=-1)
+    elif ref_trainable_cpu is not None:
+        ref_blob: Optional[dict[str, torch.Tensor]] = None
+        try:
+            if isinstance(ref_trainable_cpu, str):
+                ref_blob = _load_trainable_checkpoint_cpu(ref_trainable_cpu)
+                ref_map: dict[str, torch.Tensor] = ref_blob
+            else:
+                ref_map = ref_trainable_cpu
+            trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+            saved: list[tuple[str, torch.Tensor]] = []
+            with torch.no_grad():
+                prev_training = model.training
+                model.eval()
+                try:
+                    for name, param in trainable:
+                        if name in ref_map:
+                            saved.append((name, param.detach().clone()))
+                            param.copy_(
+                                ref_map[name].to(
+                                    device=param.device,
+                                    dtype=param.dtype,
+                                    non_blocking=True,
+                                )
+                            )
+                    ref_out = model(**model_kwargs)
+                finally:
+                    for name, tensor in saved:
+                        for p_name, p in model.named_parameters():
+                            if p_name == name:
+                                p.copy_(tensor)
+                                break
+                    model.train(prev_training)
+                ref_shift = ref_out.logits[..., :-1, :].contiguous()
+                ref_per = selective_log_softmax(ref_shift, shift_labels)
+                ref_per = ref_per * shift_cm
+                ref_logps = ref_per.sum(dim=-1)
+        finally:
+            if ref_blob is not None:
+                del ref_blob
+
+        outputs = model(**model_kwargs)
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        per_token = selective_log_softmax(shift_logits, shift_labels)
+        per_token = per_token * shift_cm
+        logps = per_token.sum(dim=-1)
+    else:
+        outputs = model(**model_kwargs)
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        per_token = selective_log_softmax(shift_logits, shift_labels)
+        per_token = per_token * shift_cm
+        logps = per_token.sum(dim=-1)
+        with torch.no_grad():
             ref_out = model(**model_kwargs)
-        ref_shift = ref_out.logits[..., :-1, :].contiguous()
-        ref_per = selective_log_softmax(ref_shift, shift_labels)
-        ref_per = ref_per * shift_cm
-        ref_logps = ref_per.sum(dim=-1)
+            ref_shift = ref_out.logits[..., :-1, :].contiguous()
+            ref_per = selective_log_softmax(ref_shift, shift_labels)
+            ref_per = ref_per * shift_cm
+            ref_logps = ref_per.sum(dim=-1)
 
     chosen_logps, rejected_logps = logps.chunk(2, dim=0)
     ref_chosen, ref_rejected = ref_logps.chunk(2, dim=0)
@@ -206,6 +285,7 @@ def _mini_train_mean_loss_dpo(
     _trainable_params,
     _bf16_autocast,
     gradient_accumulation_steps: int = 1,
+    ref_trainable_cpu: Optional[Union[dict[str, torch.Tensor], str]] = None,
 ) -> float:
     gas = max(1, int(gradient_accumulation_steps))
     optimizer = _make_optimizer(model, lr, optimizer_name)
@@ -222,7 +302,9 @@ def _mini_train_mean_loss_dpo(
                 inputs = {k: v.to(device) for k, v in batch.items()}
                 last_inputs = inputs
                 with _bf16_autocast(device):
-                    loss = dpo_sigmoid_loss(model, inputs, beta=beta) / float(gas)
+                    loss = dpo_sigmoid_loss(
+                        model, inputs, beta=beta, ref_trainable_cpu=ref_trainable_cpu
+                    ) / float(gas)
                 if not torch.isfinite(loss):
                     return float("inf")
                 loss.backward()
@@ -232,7 +314,9 @@ def _mini_train_mean_loss_dpo(
             model.eval()
             with torch.no_grad():
                 with _bf16_autocast(device):
-                    loss_after = dpo_sigmoid_loss(model, last_inputs, beta=beta)
+                    loss_after = dpo_sigmoid_loss(
+                        model, last_inputs, beta=beta, ref_trainable_cpu=ref_trainable_cpu
+                    )
             model.train()
             if not torch.isfinite(loss_after):
                 return float("inf")
@@ -333,6 +417,13 @@ def grpo_style_clipped_loss(
     per_token_loss1 = coef_1 * advantages
     per_token_loss2 = coef_2 * advantages
     per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+    # LR-finder proxy for GRPO-without-reference:
+    # when beta==0 and old_logps are detached from the same forward pass,
+    # the clipped ratio objective collapses to a constant (-1), carrying no LR signal.
+    # Use completion-token NLL as a stable proxy so LR search remains informative.
+    if beta == 0.0:
+        per_token_loss = -per_token_logps
 
     if beta != 0.0:
         with torch.no_grad():
@@ -468,6 +559,7 @@ def mini_train_mean_loss_for_task(
     _trainable_params,
     _bf16_autocast,
     gradient_accumulation_steps: int = 1,
+    dpo_ref_trainable_cpu: Optional[Union[dict[str, torch.Tensor], str]] = None,
 ) -> float:
     task_n = normalize_lr_finder_task(task)
     if task_n == LR_TASK_DPO:
@@ -484,6 +576,7 @@ def mini_train_mean_loss_for_task(
             _make_optimizer=_make_optimizer,
             _trainable_params=_trainable_params,
             _bf16_autocast=_bf16_autocast,
+            ref_trainable_cpu=dpo_ref_trainable_cpu,
         )
     if task_n == LR_TASK_GRPO:
         return _mini_train_mean_loss_grpo(

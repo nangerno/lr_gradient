@@ -4,7 +4,8 @@ import json
 import math
 import os
 import tempfile
-from typing import Any, Callable, Optional
+import warnings
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import torch
@@ -96,12 +97,22 @@ def _can_run(model, tokenizer, batch_size: int, seq_len: int, device: str) -> bo
         raise
 
 
-def _can_run_dpo(model, tokenizer, batch_pairs: int, seq_len: int, device: str, beta: float) -> bool:
+def _can_run_dpo(
+    model,
+    tokenizer,
+    batch_pairs: int,
+    seq_len: int,
+    device: str,
+    beta: float,
+    ref_trainable_cpu: Optional[Union[dict[str, torch.Tensor], str]] = None,
+) -> bool:
     """``batch_pairs`` preference pairs → ``2 * batch_pairs`` rows (TRL-shaped batch)."""
     try:
         inputs = synthetic_dpo_batch(tokenizer, batch_pairs, seq_len, device)
         with _bf16_autocast(device):
-            loss = dpo_sigmoid_loss(model, inputs, beta=beta)
+            loss = dpo_sigmoid_loss(
+                model, inputs, beta=beta, ref_trainable_cpu=ref_trainable_cpu
+            )
         loss.backward()
         model.zero_grad()
         torch.cuda.empty_cache()
@@ -155,6 +166,7 @@ def find_max_batch_size(
     b_train_cap: Optional[int] = None,
     lr_task: str = LR_TASK_INSTRUCT,
     dpo_beta: float = 0.1,
+    dpo_ref_trainable_cpu: Optional[Union[dict[str, torch.Tensor], str]] = None,
     grpo_epsilon_low: float = 0.2,
     grpo_epsilon_high: float = 0.2,
     grpo_beta: float = 0.04,
@@ -163,7 +175,15 @@ def find_max_batch_size(
 
     def _probe_ok(unit_batch: int) -> bool:
         if task == LR_TASK_DPO:
-            return _can_run_dpo(model, tokenizer, unit_batch, seq_len, device, dpo_beta)
+            return _can_run_dpo(
+                model,
+                tokenizer,
+                unit_batch,
+                seq_len,
+                device,
+                dpo_beta,
+                ref_trainable_cpu=dpo_ref_trainable_cpu,
+            )
         if task == LR_TASK_GRPO:
             return _can_run_grpo(
                 model,
@@ -377,9 +397,155 @@ def _pick_lr_peak_edge_of_stability(
     return min(finite, key=lambda x: x[1])[0]
 
 
+def _lr_elbow_index_first_half_gain(
+    losses: np.ndarray,
+    lo: int,
+    hi: int,
+    *,
+    improve_frac: float = 0.5,
+) -> int:
+    """
+    First index in ``[lo, hi]`` (LR ascending) whose loss has improved by at least
+    ``improve_frac`` of the drop from a short high-loss plateau (median of first ≤3
+    points in the window) down to the window minimum.
+
+    This tracks the LR-finder **elbow** (e.g. ~1.2e-5 when a later point is a batch-noise
+    needle at ~6e-5) instead of always using the raw argmin loss.
+    """
+    if lo > hi:
+        return max(0, int(lo))
+    lo = max(0, min(int(lo), int(len(losses)) - 1))
+    hi = max(lo, min(int(hi), int(len(losses)) - 1))
+    Lw = losses[lo : hi + 1]
+    if Lw.size == 0:
+        return lo
+    k = int(min(3, int(Lw.size)))
+    L_high = float(np.median(Lw[:k]))
+    L_min = float(np.min(Lw))
+    span = max(L_high - L_min, 1e-18)
+    frac = max(0.0, min(1.0, float(improve_frac)))
+    thr = L_high - frac * span
+    for gi in range(lo, hi + 1):
+        if float(losses[gi]) <= thr:
+            return gi
+    return int(lo + int(np.argmin(Lw)))
+
+
+def _pick_lr_torch_lr_finder_style(
+    lr_losses: dict[float, float],
+    *,
+    smooth_beta: float = 0.98,
+    skip_start_frac: float = 0.1,
+    skip_end_frac: float = 0.1,
+    lr_divisor: float = 10.0,
+    elbow_improve_frac: float = 0.5,
+) -> tuple[float, str, int]:
+    finite = [(lr, loss) for lr, loss in lr_losses.items() if math.isfinite(loss)]
+    if not finite:
+        lr0 = min(lr_losses.keys())
+        return lr0, "no finite mean losses; returning smallest LR key", 0
+    finite.sort(key=lambda x: x[0])
+    lrs = np.array([float(x[0]) for x in finite], dtype=np.float64)
+    losses = np.array([float(x[1]) for x in finite], dtype=np.float64)
+    n = int(lrs.shape[0])
+    if n < 3:
+        mid = max(0, n // 2)
+        return float(lrs[mid]), "insufficient finite points for gradient rule", int(mid)
+
+    beta = min(0.9999, max(0.0, float(smooth_beta)))
+    ema = np.empty_like(losses, dtype=np.float64)
+    avg = 0.0
+    for i, loss in enumerate(losses):
+        avg = beta * avg + (1.0 - beta) * loss
+        ema[i] = avg / (1.0 - beta ** (i + 1))
+
+    grads = np.gradient(ema, np.log(np.maximum(lrs, 1e-300)))
+    i0 = int(math.floor(max(0.0, min(0.9, float(skip_start_frac))) * n))
+    i1 = int(math.ceil((1.0 - max(0.0, min(0.9, float(skip_end_frac)))) * n))
+    i0 = min(i0, n - 1)
+    i1 = max(i0 + 1, min(i1, n))
+    idx = int(i0 + np.argmin(grads[i0:i1])) if i1 > i0 else int(np.argmin(grads))
+
+    # Detect divergence boundary on smoothed loss and keep only the stable prefix.
+    div_end = n - 1
+    for i in range(1, n):
+        roll_min = float(np.min(ema[: i + 1]))
+        prev = max(float(ema[i - 1]), 1e-12)
+        if ema[i] > 1.8 * max(roll_min, 1e-12) or ema[i] > 1.35 * prev:
+            div_end = i - 1
+            break
+    hi = max(i0, min(i1 - 1, div_end))
+    lo = min(i0, hi)
+    best_local = int(lo + np.argmin(losses[lo : hi + 1]))
+    elbow_i = _lr_elbow_index_first_half_gain(
+        losses, lo, hi, improve_frac=elbow_improve_frac
+    )
+
+    raw = float(lrs[idx])  # steepest-descent LR (classic torch-lr-finder anchor)
+    loss_floor_lr = float(lrs[best_local])  # LR at minimum observed loss in stable window
+    elbow_lr = float(lrs[elbow_i])
+    # Prefer the more conservative (lower) LR between elbow and loss-floor — avoids
+    # single-batch needles to the right of the real knee.
+    best_lr = float(min(elbow_lr, loss_floor_lr))
+    div = max(1.0, float(lr_divisor))
+    floor_lr = raw / div
+    chosen = max(best_lr, floor_lr)
+    chosen = max(float(lrs[0]), min(float(lrs[-1]), chosen))
+    msg = (
+        f"torch_lr_finder: n={n}, smooth_beta={beta:g}, "
+        f"search_window=[{i0},{i1 - 1}], stable_window=[{lo},{hi}], "
+        f"steepest_lr={raw:.2e}, elbow_lr={elbow_lr:.2e} (half-gain frac={elbow_improve_frac:g}), "
+        f"loss_floor_lr={loss_floor_lr:.2e}, best_pre_div={best_lr:.2e}, "
+        f"lr_floor=steepest/{div:g}={floor_lr:.2e} -> lr={chosen:.2e}"
+    )
+    return chosen, msg, int(elbow_i)
+
+
 def _env_flag(name: str) -> bool:
     v = os.environ.get(name, "").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+def _refinement_downward_spike_mask(
+    losses_in_lr_order: list[float],
+    *,
+    neighbor_ratio_max: float = 0.22,
+) -> list[bool]:
+    """
+    Mark points whose mean loss is far below **both** neighbors on a log-LR line.
+
+    With ``batch_size=1`` mini-trains, a single lucky batch can produce a bogus sharp
+    minimum; those points should not win ``argmin(loss)`` outright.
+    """
+    n = len(losses_in_lr_order)
+    out = [False] * n
+    if n < 2:
+        return out
+    thr = max(1e-9, min(0.45, float(neighbor_ratio_max)))
+    if n == 2:
+        a, b = losses_in_lr_order[0], losses_in_lr_order[1]
+        if a < thr * b:
+            out[0] = True
+        if b < thr * a:
+            out[1] = True
+        return out
+    for i in range(n):
+        mid = losses_in_lr_order[i]
+        if i == 0:
+            right = losses_in_lr_order[1]
+            if right > 1e-18 and mid < thr * right:
+                out[i] = True
+            continue
+        if i == n - 1:
+            left = losses_in_lr_order[i - 1]
+            if left > 1e-18 and mid < thr * left:
+                out[i] = True
+            continue
+        left, right = losses_in_lr_order[i - 1], losses_in_lr_order[i + 1]
+        m = min(left, right)
+        if m > 1e-18 and mid < thr * m:
+            out[i] = True
+    return out
 
 
 def _pick_refinement_lr_with_tie_break(
@@ -388,11 +554,16 @@ def _pick_refinement_lr_with_tie_break(
     *,
     atol: float = 1e-5,
     rtol: float = 1e-4,
+    median_margin_frac: float = 0.0,
 ) -> tuple[Optional[int], float, float]:
     """
     Among refinement points, let ``min_v`` be the minimum finite mean loss. Keep every
     point with loss ≤ ``min_v + atol + rtol·max(|min_v|, 1e-8)`` (near-optimal band), then
     pick the **lowest LR** in that band (conservative; breaks DPO/GRPO ``0.0000`` ties).
+
+    When ``median_margin_frac`` > 0, widen the band by at least that fraction of the
+    median observed loss so tiny ``min_v`` (often noise at batch_size=1) does not shrink
+    the pool to a single spurious point.
     """
     triples: list[tuple[int, float, float]] = []
     for i, lr in enumerate(refine_lrs):
@@ -402,10 +573,57 @@ def _pick_refinement_lr_with_tie_break(
     if not triples:
         return None, float("inf"), float("inf")
     min_v = min(t[2] for t in triples)
+    med_v = float(np.median([t[2] for t in triples]))
     margin = atol + rtol * max(abs(min_v), 1e-8)
+    if median_margin_frac > 0.0 and math.isfinite(med_v):
+        margin = max(margin, float(median_margin_frac) * max(abs(med_v), 1e-12))
     pool = [(i, lr, v) for i, lr, v in triples if v <= min_v + margin]
     i_best, lr_best, v_best = min(pool, key=lambda t: (t[1], t[0]))
     return i_best, v_best, lr_best
+
+
+def _pick_refinement_lr_robust(
+    refine_lrs: list[float],
+    refine_losses: dict[float, float],
+    *,
+    atol: float,
+    rtol: float,
+    neighbor_ratio_max: float = 0.22,
+    median_margin_frac: float = 0.12,
+) -> tuple[float, float, str]:
+    """
+    Refinement LR: drop downward-spike points, then apply ``_pick_refinement_lr_with_tie_break``.
+
+    Returns ``(lr_best, loss_at_best, note)``.
+    """
+    pairs = [(lr, refine_losses[lr]) for lr in refine_lrs if math.isfinite(refine_losses.get(lr, float("inf")))]
+    if not pairs:
+        return float("nan"), float("inf"), "no finite refinement losses"
+    pairs.sort(key=lambda x: x[0])
+    vals = [v for _, v in pairs]
+    mask = _refinement_downward_spike_mask(vals, neighbor_ratio_max=neighbor_ratio_max)
+    dropped = sum(1 for b in mask if b)
+    kept = [pairs[i] for i in range(len(pairs)) if not mask[i]]
+    note = ""
+    if dropped and len(kept) >= 1:
+        note = f"dropped {dropped} downward-spike point(s) (batch-noise guard)"
+    if len(kept) < 1:
+        kept = pairs
+        note = "spike guard skipped (would empty)"
+    k_lrs = [p[0] for p in kept]
+    k_loss = {lr: v for lr, v in kept}
+    idx, v_best, lr_best = _pick_refinement_lr_with_tie_break(
+        k_lrs,
+        k_loss,
+        atol=atol,
+        rtol=rtol,
+        median_margin_frac=median_margin_frac,
+    )
+    if idx is None or not math.isfinite(v_best):
+        lr_fb, v_fb = min(kept, key=lambda x: x[1])
+        fb = "tie-break fallback to raw min"
+        return lr_fb, v_fb, f"{note}; {fb}" if note else fb
+    return lr_best, v_best, note
 
 
 def _local_window_quadratic_log_lr_fit(
@@ -641,6 +859,7 @@ def _lr_finder_cap_batch_with_optimizer_probe(
     max_grad_norm: float = 1.0,
     lr_task: str = LR_TASK_INSTRUCT,
     dpo_beta: float = 0.1,
+    dpo_ref_trainable_cpu: Optional[Union[dict[str, torch.Tensor], str]] = None,
     grpo_epsilon_low: float = 0.2,
     grpo_epsilon_high: float = 0.2,
     grpo_beta: float = 0.04,
@@ -731,7 +950,12 @@ def _lr_finder_cap_batch_with_optimizer_probe(
                 optimizer.zero_grad()
                 with _bf16_autocast(device):
                     if task == LR_TASK_DPO:
-                        loss = dpo_sigmoid_loss(model, inputs, beta=dpo_beta)
+                        loss = dpo_sigmoid_loss(
+                            model,
+                            inputs,
+                            beta=dpo_beta,
+                            ref_trainable_cpu=dpo_ref_trainable_cpu,
+                        )
                     elif task == LR_TASK_GRPO:
                         loss = grpo_style_clipped_loss(
                             model,
@@ -751,7 +975,12 @@ def _lr_finder_cap_batch_with_optimizer_probe(
                 with torch.no_grad():
                     with _bf16_autocast(device):
                         if task == LR_TASK_DPO:
-                            loss_after = dpo_sigmoid_loss(model, inputs, beta=dpo_beta)
+                            loss_after = dpo_sigmoid_loss(
+                                model,
+                                inputs,
+                                beta=dpo_beta,
+                                ref_trainable_cpu=dpo_ref_trainable_cpu,
+                            )
                         elif task == LR_TASK_GRPO:
                             loss_after = grpo_style_clipped_loss(
                                 model,
@@ -1050,22 +1279,94 @@ def _run_mini_train_lr_grid(
                     )
                     return best_lr, batch_size
 
-                _pick_mode = str(lr_pick_mode or "quadratic").strip().lower()
-                if _pick_mode in ("descending_segment", "descending", "segment"):
-                    best_lr, pick_msg = _pick_lr_descending_segment(
-                        lr_losses,
-                        trim_low_lr_frac=pick_trim_low_lr_frac,
-                        explosion_rel_rolling_min=pick_explosion_rel_rolling_min,
-                        explosion_step_ratio=pick_explosion_step_ratio,
-                        segment_pick_frac=pick_segment_pick_frac,
+                _pick_mode = "torch_lr_finder"
+                try:
+                    _elbow_frac = float(os.environ.get("LR_FINDER_ELBOW_IMPROVE_FRAC", "0.5"))
+                except ValueError:
+                    _elbow_frac = 0.5
+                _elbow_frac = max(0.0, min(1.0, _elbow_frac))
+                anchor_lr, pick_msg, refine_center_idx = _pick_lr_torch_lr_finder_style(
+                    lr_losses,
+                    elbow_improve_frac=_elbow_frac,
+                )
+                print(f"  [LR Finder] {pick_msg}", flush=True)
+
+                # Second pass: repeat mini-train sweep in the best stable coarse range.
+                div_end = len(losses_arr) - 1
+                for i in range(1, len(losses_arr)):
+                    roll_min = float(np.min(losses_arr[: i + 1]))
+                    prev = max(float(losses_arr[i - 1]), 1e-12)
+                    if losses_arr[i] > 1.8 * max(roll_min, 1e-12) or losses_arr[i] > 1.35 * prev:
+                        div_end = i - 1
+                        break
+                div_end = max(0, div_end)
+                # Center refinement on the elbow index (half-gain), not raw argmin — avoids
+                # mini-train grids locked around a batch-noise loss needle.
+                best_idx = int(max(0, min(refine_center_idx, div_end)))
+                lo_idx = max(0, best_idx - 1)
+                hi_idx = min(len(lrs_arr) - 1, best_idx + 1)
+                lr_lo = float(lrs_arr[lo_idx])
+                lr_hi = float(lrs_arr[hi_idx])
+                if not (lr_hi > lr_lo):
+                    lr_lo = max(float(lrs_arr[0]), float(anchor_lr) / 3.0)
+                    lr_hi = min(float(lrs_arr[-1]), float(anchor_lr) * 3.0)
+                    if lr_hi <= lr_lo:
+                        lr_hi = max(lr_lo * 1.01, lr_lo + 1e-12)
+                refine_lrs = _log_uniform_lrs(lr_lo, lr_hi, 5)
+                print(
+                    f"  [LR Finder] refinement mini-train in stable range "
+                    f"[{lr_lo:.2e}, {lr_hi:.2e}] ({len(refine_lrs)} points) …",
+                    flush=True,
+                )
+                refine_losses: dict[float, float] = {}
+                for lr in refine_lrs:
+                    _restore_trainable_weights()
+                    try:
+                        avg_loss = _invoke_mini_train(
+                            model,
+                            dl,
+                            lr,
+                            device,
+                            optimizer_name,
+                            max_grad_norm,
+                        )
+                        refine_losses[lr] = avg_loss
+                    except RuntimeError as exc:
+                        if "out of memory" in str(exc).lower():
+                            refine_losses[lr] = float("inf")
+                            _restore_trainable_weights()
+                            gc.collect()
+                            if device == "cuda" and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        raise
+                    gc.collect()
+                    if device == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    print(f"    refine lr={lr:.2e}  mean loss={refine_losses[lr]:.6g}", flush=True)
+
+                finite_ref = [(lr, v) for lr, v in refine_losses.items() if math.isfinite(v)]
+                if finite_ref:
+                    best_lr, _ref_v, ref_note = _pick_refinement_lr_robust(
+                        refine_lrs,
+                        refine_losses,
+                        atol=refinement_tie_atol,
+                        rtol=refinement_tie_rtol,
                     )
-                    print(f"  [LR Finder] {pick_msg}", flush=True)
+                    extra = f"  ({ref_note})" if ref_note else ""
                     print(
-                        f"  [LR Finder] selected LR (longest decreasing loss vs LR, "
-                        f"log-frac={pick_segment_pick_frac:g} in segment): {best_lr:.2e}",
+                        f"  [LR Finder] selected LR (torch coarse + stable-range refinement): "
+                        f"{best_lr:.2e}{extra}",
                         flush=True,
                     )
                     return best_lr, batch_size
+
+                print(
+                    f"  [LR Finder] refinement failed; fallback to torch anchor LR: {anchor_lr:.2e}",
+                    flush=True,
+                )
+                return anchor_lr, batch_size
 
                 fit = _local_window_quadratic_log_lr_fit(lrs_arr, losses_arr, half_window=2)
                 if fit is None:
@@ -1132,6 +1433,7 @@ def _run_mini_train_lr_grid(
                         refine_losses,
                         atol=refinement_tie_atol,
                         rtol=refinement_tie_rtol,
+                        median_margin_frac=0.12,
                     )
                     if idx_best is not None:
                         best_lr = refine_lrs[idx_best]
@@ -1381,11 +1683,11 @@ def find_lr(
 
     _points = max(
         2,
-        int(dataset_type_dict.get("lr_finder_lr_probe_points", lr_probe_points)),
+        min(12, int(dataset_type_dict.get("lr_finder_lr_probe_points", lr_probe_points))),
     )
     _mini_b = max(
         1,
-        int(dataset_type_dict.get("lr_finder_mini_train_batches", mini_train_batches)),
+        min(6, int(dataset_type_dict.get("lr_finder_mini_train_batches", mini_train_batches))),
     )
     try:
         _gas_lr = int(dataset_type_dict.get("lr_finder_gradient_accumulation_steps", 1))
@@ -1393,14 +1695,11 @@ def find_lr(
         _gas_lr = 1
     _gas_lr = max(1, _gas_lr)
     try:
-        _samples_plr = int(dataset_type_dict.get("lr_finder_samples_per_lr", 80))
+        _samples_plr = int(dataset_type_dict.get("lr_finder_samples_per_lr", 24))
     except (TypeError, ValueError):
-        _samples_plr = 80
-    _samples_plr = max(0, _samples_plr)
-    _lr_pick_mode = str(
-        dataset_type_dict.get("lr_finder_lr_pick_mode", "descending_segment")
-        or "descending_segment"
-    ).strip().lower()
+        _samples_plr = 24
+    _samples_plr = max(0, min(24, _samples_plr))
+    _lr_pick_mode = "torch_lr_finder"
     try:
         _pick_trim = float(dataset_type_dict.get("lr_finder_pick_trim_low_lr_frac", 0.2))
     except (TypeError, ValueError):
@@ -1497,11 +1796,13 @@ def find_lr(
 
     if _lr_task == LR_TASK_DPO and not use_lora:
         print(
-            "[LR Finder] DPO mini-train requires LoRA so the frozen base model can serve as "
-            "the implicit reference. Skipping LR finder.",
+            "[LR Finder] DPO without LoRA: using a frozen CPU/disk snapshot of trainable weights "
+            "as the reference policy π_ref (same idea as a separate ref model, but weight-replay).",
             flush=True,
         )
-        return None
+
+    dpo_ref_trainable: Optional[Union[dict[str, torch.Tensor], str]] = None
+    dpo_ref_ckpt_path: Optional[str] = None
 
     try:
         # ------------------------------------------------------------------ #
@@ -1516,11 +1817,24 @@ def find_lr(
         # float16 has a much smaller dynamic range and produces NaN on backward.
         # ------------------------------------------------------------------ #
         print(f"[LR Finder] Loading model from {model_path} …", flush=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
+        with warnings.catch_warnings():
+            # Some model repos ship generation configs with sampling params while
+            # do_sample=False; this is harmless for training/LR probe but noisy.
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`do_sample` is set to `False`.*`temperature` is set",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`do_sample` is set to `False`.*`top_p` is set",
+                category=UserWarning,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+            )
 
         # ------------------------------------------------------------------ #
         # Apply LoRA when the task trains with LoRA (matches real training).
@@ -1550,6 +1864,40 @@ def find_lr(
                 model.gradient_checkpointing_disable()
             except AttributeError:
                 pass
+
+        # ------------------------------------------------------------------ #
+        # DPO full fine-tune: π_ref is a frozen snapshot of initial trainable weights.
+        # ------------------------------------------------------------------ #
+        if _lr_task == LR_TASK_DPO and not use_lora:
+            trainable_rows = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+            if not trainable_rows:
+                print(
+                    "[LR Finder] DPO without LoRA but no trainable parameters; cannot define π_ref. "
+                    "Skipping LR finder.",
+                    flush=True,
+                )
+                return None
+            total_trainable_bytes = sum(p.numel() * p.element_size() for _, p in trainable_rows)
+            if total_trainable_bytes > _SNAPSHOT_DISK_THRESHOLD_BYTES:
+                fd, dpo_ref_ckpt_path = tempfile.mkstemp(prefix="lr_finder_dpo_ref_", suffix=".pt")
+                os.close(fd)
+                with torch.no_grad():
+                    torch.save({n: p.detach().cpu() for n, p in trainable_rows}, dpo_ref_ckpt_path)
+                dpo_ref_trainable = dpo_ref_ckpt_path
+                gc.collect()
+                print(
+                    f"[LR Finder] DPO π_ref snapshot ≈{total_trainable_bytes / 1e9:.2f} GB trainable "
+                    f"→ disk mmap checkpoint: {dpo_ref_ckpt_path}",
+                    flush=True,
+                )
+            else:
+                with torch.no_grad():
+                    dpo_ref_trainable = {n: p.detach().cpu().clone() for n, p in trainable_rows}
+                print(
+                    "[LR Finder] DPO π_ref snapshot: in-memory CPU copy of trainable weights "
+                    f"(≈{total_trainable_bytes / 1e6:.1f} MB).",
+                    flush=True,
+                )
 
         # ------------------------------------------------------------------ #
         # Probe seq cap: synthetic search + collate pad to min(train seq, lr_finder_probe_seq_len).
@@ -1600,6 +1948,7 @@ def find_lr(
             b_train_cap=_b_train_cap,
             lr_task=_lr_task,
             dpo_beta=_dpo_beta,
+            dpo_ref_trainable_cpu=dpo_ref_trainable,
             grpo_epsilon_low=_geps_lo,
             grpo_epsilon_high=_geps_hi,
             grpo_beta=_grpo_beta_probe,
@@ -1620,6 +1969,7 @@ def find_lr(
             max_grad_norm=_max_gn,
             lr_task=_lr_task,
             dpo_beta=_dpo_beta,
+            dpo_ref_trainable_cpu=dpo_ref_trainable,
             grpo_epsilon_low=_geps_lo,
             grpo_epsilon_high=_geps_hi,
             grpo_beta=_grpo_beta_probe,
@@ -1740,6 +2090,7 @@ def find_lr(
                     _trainable_params=_trainable_params,
                     _bf16_autocast=_bf16_autocast,
                     gradient_accumulation_steps=gradient_accumulation_steps,
+                    dpo_ref_trainable_cpu=dpo_ref_trainable,
                 )
 
         if len(sample_ds) == 0:
@@ -1860,4 +2211,9 @@ def find_lr(
         return None
 
     finally:
+        if dpo_ref_ckpt_path:
+            try:
+                os.remove(dpo_ref_ckpt_path)
+            except OSError:
+                pass
         torch.cuda.empty_cache()

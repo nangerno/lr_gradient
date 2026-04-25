@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -212,6 +213,7 @@ def apply_tokenized_lr_finder_to_run_config(
         if lr is not None:
             print(f"Using lr from finder (task={_task} mini-train dataset): {lr}", flush=True)
             run_config["learning_rate"] = lr
+            run_config["learning_rate_set_by_lr_finder"] = True
         else:
             print(
                 f"LR finder returned no lr; using param-based fallback: {fallback_learning_rate}",
@@ -228,6 +230,38 @@ def apply_tokenized_lr_finder_to_run_config(
             f"{run_config['learning_rate']}",
             flush=True,
         )
+
+
+def apply_training_lr_scaling_after_lr_finder(run_config: dict, train_info: dict) -> None:
+    """
+    After ``apply_tokenized_lr_finder_to_run_config``:
+
+    * If the finder set ``learning_rate``, **do not** multiply by ``reg_ratio`` — that
+      value was chosen for conservative param-based LRs and silently shrinks a probed LR.
+      Optional ``reg_ratio_if_lr_finder`` (default ``1.0``) scales the finder LR if you
+      still want dampening.
+    * Unless ``lr_finder_keep_warmup`` is true, set ``warmup_ratio`` to
+      ``lr_finder_warmup_ratio`` (default ``0``) so the first optimizer step uses the
+      finder peak instead of linear ramp from ~0 (HF ``warmup_ratio`` behavior).
+    """
+    if not run_config.pop("learning_rate_set_by_lr_finder", False):
+        run_config["learning_rate"] *= float(train_info["reg_ratio"])
+        return
+    rr = float(train_info.get("reg_ratio_if_lr_finder", 1.0))
+    if math.isfinite(rr) and rr > 0:
+        run_config["learning_rate"] *= rr
+    if "lr_finder_warmup_ratio" in train_info:
+        run_config["warmup_ratio"] = float(train_info["lr_finder_warmup_ratio"])
+    elif not bool(train_info.get("lr_finder_keep_warmup", False)):
+        prev = float(run_config.get("warmup_ratio", 0.0) or 0.0)
+        if prev > 0.0:
+            print(
+                "[LR Finder] warmup_ratio set to 0 so training uses the finder LR from step 1 "
+                "(HF still applies cosine decay). "
+                "Set lr_finder_keep_warmup=True or lr_finder_warmup_ratio=<float> to keep warmup.",
+                flush=True,
+            )
+        run_config["warmup_ratio"] = float(train_info.get("lr_finder_warmup_ratio", 0.0))
 
 
 def is_dataset_available_for_lr_finder(dataset_path: Optional[str]) -> bool:

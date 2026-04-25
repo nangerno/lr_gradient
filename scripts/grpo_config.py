@@ -11,6 +11,7 @@ from copy import deepcopy
 
 from lrs_lookup import (
     apply_tokenized_lr_finder_to_run_config,
+    apply_training_lr_scaling_after_lr_finder,
     effective_lr_finder_probe_seq_len,
     effective_lr_finder_seq_len,
 )
@@ -229,7 +230,7 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
         "lr_finder_lr_probe_points": int(
             train_info.get(
                 "lr_finder_lr_probe_points",
-                train_info.get("lr_finder_steps", 28),
+                train_info.get("lr_finder_steps", 12),
             )
         ),
         "lr_finder_mini_train_batches": int(
@@ -346,7 +347,7 @@ def get_training_json(train_info: dict, *, run_lr_finder: bool = True) -> dict:
             fallback_learning_rate=_lr_from_param_nums(param_nums),
         )
 
-    run_config["learning_rate"] *= train_info["reg_ratio"]
+    apply_training_lr_scaling_after_lr_finder(run_config, train_info)
 
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
 
